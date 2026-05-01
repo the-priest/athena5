@@ -9,7 +9,7 @@
 ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝
 ```
 
-**AI Offensive Security Agent v5.0**  
+**AI Offensive Security Agent v6.1**  
 *Bare-metal Kali NetHunter · sdm845 · Phosh UI*
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python)
@@ -29,13 +29,71 @@ Athena is an elite AI offensive security agent that runs entirely in your termin
 
 You give it a target or an objective. It thinks like a senior penetration tester, proposes one command at a time, and waits for your approval before running anything. Every decision is explained. Nothing executes silently.
 
-**This is not a script kiddie tool. Athena reasons about what she finds.**
+**This is not a script kiddie tool. Athena reasons about what she finds, and now she actually exploits them.**
 
 ---
 
-## What Makes v5.0 Different
+## What's New in v6.1
 
-The core upgrade in v5.0 is a **14-section expert knowledge base baked permanently into the AI brain** — injected into every single turn of every session. This means Athena reasons from deep expertise rather than general knowledge:
+### 🔥 Auto-Exploit Engine
+When Athena finds a CVE, she doesn't just tell you about it anymore:
+1. **Auto-runs searchsploit** to find matching exploits
+2. **Identifies exploit type** (Metasploit module vs standalone script)
+3. **Generates ready-to-run commands** with proper syntax
+4. **Asks permission** before executing
+
+Example flow:
+```
+[nmap finds Apache 2.4.49]
+⚔️  EXPLOIT AVAILABLE: CVE-2021-41773
+[OPTION 1] Apache 2.4.49 Path Traversal
+Type: Metasploit Module
+Suggested command:
+  echo 'use exploit/multi/http/apache_normalize_path_rce' > /tmp/exploit.rc
+  echo 'set RHOSTS 192.168.1.1' >> /tmp/exploit.rc
+  ...
+  msfconsole -q -r /tmp/exploit.rc
+
+Execute? [y/n]
+```
+
+### 💾 Persistent Findings
+- All findings saved to `~/.athena/findings.json` after **every command**
+- Auto-loads on startup — never lose progress on crash
+- Survives reboots, crashes, API rate limits
+- Token-efficient storage (only unique values, max 30 per type)
+
+### 🔄 Stuck Recovery (Actually Works)
+When Athena hits a wall (3 consecutive failures/skips/repeats):
+1. **Detects the stuck state** automatically
+2. **Asks AI for 3 completely different approaches**
+3. **You pick** which direction to pursue
+4. **Pivots immediately** to the new strategy
+
+No more infinite loops of the same failed command.
+
+### 🛡️ Rate Limit Resilience
+- **Retries failed requests** on next provider instead of losing them
+- **9-provider fallback chain** (LLaMA 3.3 70B → GPT-OSS 120B → LLaMA 4 Scout → Qwen3 → ...)
+- **Cloudflare detection** with automatic provider skip
+- **Never crashes** on API errors — falls back gracefully
+
+### 🔑 Smarter Credential Attacks
+- **Uses wordlist files** instead of 4 hardcoded passwords
+- **Auto-loads** `/usr/share/wordlists/metasploit/common_passwords.txt` (top 20)
+- **Fallback list** of 11 common passwords if files missing
+- **Lockout-aware** timing built into workflows
+
+### 🧠 Intelligent Output Compression
+- **Exploit results**: Kept intact (shell output, credentials, proof)
+- **Scan noise**: Compressed aggressively (saves ~60% tokens)
+- **History optimized**: Removes [THOUGHT] blocks from old messages (saves ~40% tokens)
+
+---
+
+## What Made v5.0→v6.1 Different
+
+The core upgrade in v5.0 was a **14-section expert knowledge base baked permanently into the AI brain** — injected into every single turn of every session. v6.1 keeps all that expertise and adds **action**:
 
 - **Elite pentester mindset** — objective-first thinking, trust boundary analysis, noise level awareness, fallback planning, APT-style decision making
 - **Complete web exploitation** — SQLi cheat sheet, XSS filter bypass, SSRF cloud metadata chains, LFI→RCE full path, XXE, template injection for every engine, JWT attacks, OAuth flaws, deserialization fingerprinting
@@ -57,7 +115,10 @@ The core upgrade in v5.0 is a **14-section expert knowledge base baked permanent
 - **Free to run** — Groq free tier, no paid subscription needed
 - **Human-in-the-loop** — you approve every command before execution
 - **Transparent reasoning** — [THOUGHT] block explains every decision before every command
-- **CVE auto-lookup** — searchsploit runs automatically after every service discovery
+- **Auto-exploit engine** — searchsploit + ready-to-run commands when CVE found
+- **CVE auto-lookup** — runs automatically after every service discovery
+- **Persistent findings** — saved to disk after every command, survives crashes
+- **Stuck recovery** — detects loops and suggests 3 alternative approaches
 - **Findings memory** — extracts IPs, ports, usernames, hashes, credentials, CVEs from every command and remembers them all session
 - **Auto-pivot** — every prompt includes live findings so Athena connects a username from one step to a service from another automatically
 - **LHOST auto-detection** — your attack IP detected at launch, injected into all payload workflows
@@ -65,14 +126,15 @@ The core upgrade in v5.0 is a **14-section expert knowledge base baked permanent
 - **Session report** — structured report generated on exit with all findings
 - **23 pre-built workflows** covering the complete offensive security kill chain
 - **Phosh-safe** — hard-blocks all `apt upgrade` variants that would destroy the Phosh UI
+- **Rate limit resilient** — 9-provider fallback chain, never crashes on API errors
 
 ---
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/athena.git
-cd athena
+git clone https://github.com/the-priest/athena5.git
+cd athena5
 bash install.sh
 athena
 ```
@@ -95,8 +157,8 @@ athena
 sudo apt install -y git
 
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/athena.git
-cd athena
+git clone https://github.com/the-priest/athena5.git
+cd athena5
 
 # Run the installer — handles everything
 bash install.sh
@@ -167,7 +229,9 @@ You see the reasoning and proposed command
         │
      [y / n / q]
         │
-   y = execute ──→ output captured ──→ CVE auto-lookup ──→ findings extracted
+   y = execute ──→ output captured ──→ CVE auto-lookup ──→ exploit suggestion
+                                               │
+                              findings extracted ──→ saved to disk
                                                │
                               fed back to model with pivot context
                                                │
@@ -183,8 +247,12 @@ You see the reasoning and proposed command
 | `workflow` | Open the 23-workflow menu |
 | `target` | Set or update the session target |
 | `findings` | Show all findings extracted this session |
+| `remember` | Save important findings (persistent across sessions) |
+| `recall` | Load remembered facts into AI context |
+| `tools` | Show tool availability + auto-install missing |
 | `save` | Save conversation to file |
 | `report` | Generate structured session report |
+| `model` | Show current provider and full chain |
 | `clear` | Clear AI memory (findings preserved) |
 | `help` | Show command reference |
 | `exit` / `q` | End session and generate report |
@@ -194,12 +262,22 @@ You see the reasoning and proposed command
 ## File Structure
 
 ```
-athena/
-├── athena.py          Complete agent — single Python file, 1700+ lines
+athena5/
+├── athena.py          Complete agent — single Python file, 2000+ lines
 ├── install.sh         Automated installer
 ├── requirements.txt   Python deps (groq only)
 ├── LICENSE            MIT
 └── README.md          This file
+```
+
+After first run:
+```
+~/.athena/
+├── findings.json      Persistent findings (survives crashes)
+├── remembered.txt     User-saved facts (remember/recall)
+└── logs/
+    ├── session_*.txt  Full session logs
+    └── report_*.txt   Structured reports
 ```
 
 ---
@@ -218,11 +296,38 @@ athena/
 
 **Running from Termux** — Web tools work fine, raw socket tools (arp-scan) need root
 
+**Stuck in loop** — Wait for 3 failures, stuck recovery will trigger automatically
+
+**Rate limit hit** — Athena auto-switches to next provider in chain, no action needed
+
+**Findings lost on crash** — They're saved to `~/.athena/findings.json`, just restart athena
+
 ---
 
 ## Legal Notice
 
 > This tool is for authorized security testing only. Use only on systems you own or have explicit written permission to test. Unauthorized use against third-party systems is illegal. The authors accept no liability for misuse.
+
+---
+
+## Changelog
+
+### v6.1 (2024)
+- ✅ Auto-exploit engine with ready-to-run commands
+- ✅ Persistent findings saved to disk
+- ✅ Stuck recovery that actually works
+- ✅ Rate limit resilience with 9-provider chain
+- ✅ Smarter credential attacks using wordlist files
+- ✅ Intelligent output compression
+- ✅ Enhanced CVE lookup by number and service
+- ✅ Remember/recall system for cross-session facts
+
+### v5.0 (2024)
+- 14-section expert knowledge base
+- 23 pre-built workflows
+- Dynamic KB injection
+- Auto-pivot on findings
+- Session logging and reporting
 
 ---
 

