@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# NEVER commit your API key
+.env
+*.env
+.envrc
+secrets.txt
+config.ini
+
+# Athena runtime files
+/tmp/athena_session.lock
+/tmp/athena_msf.rc
+logs/
+*.log
+
+# Session data — stays on your device
+~/.athena/
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
