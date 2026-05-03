@@ -1,43 +1,60 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║           ATHENA — AI Offensive Security Agent v7.1              ║
-║   Bare-metal Kali NetHunter | sdm845 | Phosh UI                  ║
-║   Commander: The Priest                                           ║
-║                                                                    ║
-║   v7.1 — TOOL DISPATCH + ATT&CK + SCOPE + GRAPH + SMART CTX      ║
-║                                                                    ║
-║   NEW IN v7.1:                                                    ║
-║   • TOOL DISPATCH — LLM emits [TOOL]name[/TOOL][ARGS]json[/ARGS]  ║
-║     and ToolBuilder constructs the shell string deterministically.║
-║     Falls back to [CMD] for ad-hoc commands.  No hallucinated     ║
-║     flags possible on registered tools.                           ║
-║   • MITRE ATT&CK auto-tagging — every command + finding tagged    ║
-║     with technique IDs (T1046, T1110.003, T1003, etc).  Reports   ║
-║     grouped by technique for professional deliverables.           ║
-║   • Scope / RoE enforcement — ~/.athena/scope.json defines        ║
-║     allowed CIDRs, domains, time windows.  Out-of-scope commands  ║
-║     refused before execution.                                     ║
-║   • Auto credential fanout — when a cred verifies, queue tests    ║
-║     against every auth-able service in the PTT automatically.     ║
-║   • Attack graph (networkx) — hosts, services, creds as nodes;    ║
-║     "cred X works on service Y" as edges.  Surfaces pivot         ║
-║     suggestions the LLM might miss.                               ║
-║   • Smart context manager — minimal context per turn (active      ║
-║     node + verified findings + last 4 history) saves ~50% tokens  ║
-║     vs v7.0; LLM can request more via [NEED]ptt|history|graph|kb  ║
-║     section[/NEED] when it actually needs them.                   ║
-║                                                                    ║
-║   PRESERVED FROM v7.0:                                            ║
-║   • Pentesting Task Tree (PTT)                                    ║
-║   • Specialist agent dispatcher                                   ║
-║   • Source-tagged finding extraction                              ║
-║   • PoC verification queue                                        ║
-║   • Confidence filter (green/yellow/red)                          ║
-║   • Cleanup pass on report                                        ║
-║   • Comprehensive Kali tool registry — 200+ tools                 ║
-║   • Groq provider chain                                           ║
-║   • No on-disk persistence                                        ║
+║           ATHENA — AI Offensive Security Agent v7.2              ║
+║   Bare-metal Kali NetHunter  ·  Commander: The Priest             ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                  ║
+║   v7.2 — RELIABILITY + UI OVERHAUL                               ║
+║                                                                  ║
+║   FIXES (from v7.1 field-test failures)                          ║
+║   • Tool dispatch no longer silently drops unknown kwargs.       ║
+║     Common synonyms (skip_host_discovery, scan_type,             ║
+║     timing_template, open_only, ...) are mapped to real flags.   ║
+║     Truly unknown kwargs become a hard error fed back into the   ║
+║     LLM's NEXT prompt — so it can correct, not loop.             ║
+║   • Sudo escalation: when a command fails with permission        ║
+║     denied / CAP_NET_RAW / requires-root markers, Athena         ║
+║     offers to re-run with sudo (one-tap retry).                  ║
+║   • Tool availability is checked BEFORE dispatch.  Missing       ║
+║     binaries raise a structured error so the LLM pivots.         ║
+║   • Type-safe scripts param: list/dict/json artifacts in the     ║
+║     `scripts` arg are normalised to a comma-separated string.    ║
+║   • Loop-breaker: same shell command twice → forced agent        ║
+║     rotation + RED conf override.  Three times → handle_stuck.   ║
+║   • Confidence is failure-aware: N consecutive fails on a node   ║
+║     forces RED regardless of the LLM's self-rating.  Workflow    ║
+║     CANNOT auto-complete on a streak of failures.                ║
+║   • Phosh UI guard now confirms the package is INSTALLED         ║
+║     (dpkg-query) before flagging — no more false-alarms on a     ║
+║     phone where xfce was never installed.                        ║
+║   • Per-command timeouts: top-ports/short scans 90s,             ║
+║     full-range scans 600s, brute-force tools 1800s.              ║
+║   • Boot lock auto-expires after 6h.                             ║
+║                                                                  ║
+║   UI OVERHAUL                                                    ║
+║   • Every turn renders as a stack of titled boxes:               ║
+║       ┌─ TURN N · target · agent · findings · ATT&CK · model ─┐  ║
+║       ┌─ THOUGHT ─┐                                              ║
+║       ┌─ DISPATCH ─┐                                             ║
+║       ┌─ COMMAND  conf=GREEN  ATT&CK=T1046 ─┐                    ║
+║       ┌─ EXECUTING ─┐ ... ┌─ RESULT ─┐                           ║
+║       ┌─ FINDINGS +N ─┐                                          ║
+║       ┌─ ⛔ ERROR ─┐  for permission/scope/destructive          ║
+║   • Persistent status bar still rendered before each prompt.     ║
+║                                                                  ║
+║   PRESERVED FROM v7.1                                            ║
+║   • Pentesting Task Tree (PTT)                                   ║
+║   • 11 specialist agents, deterministic dispatch                 ║
+║   • 28+ structured tool builders                                 ║
+║   • MITRE ATT&CK auto-tagging                                    ║
+║   • Scope / RoE enforcement                                      ║
+║   • Attack graph (networkx)                                      ║
+║   • Smart context manager + [NEED] re-fetches                    ║
+║   • Auto credential fanout                                       ║
+║   • Comprehensive Kali tool registry — 200+ tools                ║
+║   • Groq provider chain                                          ║
+║   • No on-disk persistence (except scope + logs + reports)       ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -48,9 +65,11 @@ import json
 import time
 import getpass
 import signal
+import inspect
 import datetime
 import subprocess
 import ipaddress
+import shutil
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Dict, Any, Tuple, Set
 
@@ -78,7 +97,7 @@ except ImportError:
 # VERSION & PROVIDER CHAIN  (Groq only, biggest→smallest)
 # ═════════════════════════════════════════════════════════════════════
 
-VERSION = "7.1"
+VERSION = "7.2"
 
 # Strict size descending. Compound models last because they have their
 # own internal multi-step behaviour that fights our PTT control flow.
@@ -118,6 +137,162 @@ MAX_NEED_FETCHES = 2
 # Stuck thresholds
 STUCK_THRESHOLD      = 3   # rejects/repeats before pivot
 NODE_ATTEMPT_LIMIT   = 4   # attempts on a single PTT node before mark dead-end
+
+
+# ═════════════════════════════════════════════════════════════════════
+# v7.2 — TIMEOUTS, SUDO MARKERS, BOOT LOCK TTL
+# ═════════════════════════════════════════════════════════════════════
+
+# Per-command timeout policy.  The bash subprocess is killed if it runs
+# longer than the matched ceiling.  Pattern is regex-against-cmd; first
+# match wins.  Default ceiling at the bottom.
+COMMAND_TIMEOUTS = [
+    (r'\bnmap\b.*-p\s*1?-\s*65535', 600),    # full-port nmap
+    (r'\bnmap\b.*-p-\b',            600),    # full-port shorthand
+    (r'\bmasscan\b',                300),
+    (r'\brustscan\b',               300),
+    (r'\bnmap\b.*--top-ports',       90),
+    (r'\bnmap\b',                   180),
+    (r'\b(hydra|medusa|patator|ncrack)\b', 1800),
+    (r'\b(hashcat|john)\b',                 3600),
+    (r'\b(gobuster|feroxbuster|ffuf|dirb|dirsearch)\b', 600),
+    (r'\b(nikto|nuclei|wpscan)\b',           900),
+    (r'\bsqlmap\b',                          900),
+    (r'\b(theharvester|amass|subfinder)\b',  600),
+    (r'\bsearchsploit\b',                     30),
+    (r'\bcurl\b',                             45),
+    (r'\barp-scan\b',                         60),
+    (r'\bping\b',                             20),
+]
+DEFAULT_COMMAND_TIMEOUT = 300  # 5 min ceiling on anything else
+
+# Markers in stdout/stderr that mean "needs root".  When detected after
+# a non-sudo command, Athena offers an automatic sudo retry.
+SUDO_RETRY_MARKERS = [
+    "operation not permitted",
+    "permission denied",
+    "you don't have permission",
+    "you must be root",
+    "must be run as root",
+    "must be root",
+    "requires root",
+    "are you root",
+    "cap_net_raw",
+    "cap_net_admin",
+    "cap_dac_read_search",
+    "(may need root)",
+    "raw sockets",
+    "couldn't open device",
+    "bind: permission denied",
+    "socket: operation not permitted",
+]
+
+# Boot-check lock TTL.  Re-run the system check if older than this.
+BOOT_LOCK_TTL_SECONDS = 6 * 3600   # 6 hours
+
+# v7.2 — kwarg synonym map for ToolBuilder.  When the LLM emits an arg
+# that doesn't match the builder signature, we try one of these
+# synonyms BEFORE giving up.  Maps {builder_name: {wrong_name: right_name}}.
+# A right_name of None means "drop silently — this is a no-op alias".
+KWARG_SYNONYMS = {
+    "nmap": {
+        # host-discovery ↔ -Pn
+        "skip_host_discovery": "no_ping",
+        "skip_discovery":      "no_ping",
+        "no_host_discovery":   "no_ping",
+        "treat_alive":         "no_ping",
+        # scan-type — convert to canonical bool flags
+        "scan_type":     "_scan_type",   # handled specially in nmap()
+        "syn_scan":      "_scan_type",
+        "tcp_scan":      "_scan_type",
+        "connect_scan":  "_scan_type",
+        # timing
+        "timing_template": "timing",
+        "T":               "timing",
+        "speed":           "timing",
+        # ports
+        "port_range":      "ports",
+        "port":            "ports",
+        # script wording
+        "nse_scripts":     "scripts",
+        "script":          "scripts",
+        "scripts_list":    "scripts",
+        "script_categories": "scripts",
+        # version / aggressive aliases
+        "service_version": "version",
+        "version_detect":  "version",
+        "agg":             "aggressive",
+        # open-only filter — push into extra_args
+        "open_only":       "_open_only",
+        "open":            "_open_only",
+    },
+    "masscan": {
+        "use_root":    "use_sudo",
+        "rate_pps":    "rate",
+        "iface":       "interface",
+        "port_range":  "ports",
+    },
+    "rustscan": {
+        "rate":        "batch_size",
+        "port_range":  "ports",
+    },
+    "gobuster_dir": {
+        "url_target":  "url",
+        "exts":        "extensions",
+        "ext":         "extensions",
+        "wordlist_path":"wordlist",
+    },
+    "feroxbuster": {
+        "url_target":  "url",
+        "exts":        "extensions",
+        "ext":         "extensions",
+    },
+    "ffuf": {
+        "target":      "url",
+        "fuzz_loc":    "location",
+    },
+    "hydra": {
+        "host":        "target",
+        "user_list":   "userlist",
+        "pass_list":   "passlist",
+        "users":       "userlist",
+        "passes":      "passlist",
+        "threads":     "tasks",
+    },
+    "sqlmap": {
+        "target":      "url",
+        "lvl":         "level",
+    },
+    "curl_basic": {
+        "head":        "head_only",
+        "ua":          "user_agent",
+        "useragent":   "user_agent",
+        "username":    "user",
+        "passwd":      "password",
+    },
+    "hashcat": {
+        "hash":        "hash_file",
+        "wordlist_path":"wordlist",
+        "rule":        "rules",
+    },
+    "nuclei": {
+        "url":         "target",
+        "templates_dir":"templates",
+    },
+    "whatweb": {
+        "agg":         "aggression",
+        "level":       "aggression",
+    },
+    "crackmapexec": {
+        "proto":       "protocol",
+        "host":        "target",
+        "username":    "user",
+        "passwd":      "password",
+        "u_list":      "userlist",
+        "p_list":      "passlist",
+    },
+    # Tools without aliases (curl_basic etc) just inherit empty {}
+}
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -1619,12 +1794,10 @@ def extract_findings_from_stdout(output: str,
                         continue
 
                 if ftype == "user":
-                    # Drop common false-positives that appear in prose
-                    if val.lower() in {"administrator", "admin", "user", "root"}:
-                        # Real but too generic to be a finding by itself —
-                        # still record it, but mark verified=False so it can
-                        # be re-confirmed against an actual service.
-                        pass
+                    # Drop common false-positives that appear in prose.
+                    # Real but generic — record but leave verified=False
+                    # so they get re-confirmed against an actual service.
+                    pass  # intentional: no early-skip, dedup happens later
 
                 if ftype == "cred":
                     # Drop credentials that look like placeholders
@@ -1973,6 +2146,198 @@ def fancy_header(text: str, color: str = "35") -> str:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# v7.2 — boxed UI primitives
+#
+# Goal: every event a turn produces gets its own titled box, so the
+# operator can scan a session log at a glance.  Boxes are 70 cols wide
+# (most phone terminals/SSH sessions render this well).  All boxes use
+# the `panel()` building block so they share a consistent look.
+# ─────────────────────────────────────────────────────────────────────
+
+BOX_W = 70
+
+
+def _visible_len(s: str) -> int:
+    """Length without ANSI escapes."""
+    return len(re.sub(r'\033\[[\d;]*m', '', s))
+
+
+def _wrap_for_box(text: str, inner_width: int) -> List[str]:
+    """Wrap a paragraph for box rendering (ANSI-aware)."""
+    out: List[str] = []
+    for raw_line in str(text).splitlines() or [""]:
+        if not raw_line.strip():
+            out.append("")
+            continue
+        # Greedy word-wrap — doesn't account for mid-word ANSI but
+        # we only call this on plain text in practice.
+        words = raw_line.split(" ")
+        cur = ""
+        for w in words:
+            test = (cur + " " + w).strip() if cur else w
+            if _visible_len(test) <= inner_width:
+                cur = test
+            else:
+                if cur:
+                    out.append(cur)
+                # If a single word is too long, hard-cut
+                while _visible_len(w) > inner_width:
+                    out.append(w[:inner_width])
+                    w = w[inner_width:]
+                cur = w
+        if cur:
+            out.append(cur)
+    return out
+
+
+def _box(title: str, body_lines: List[str], color: str = "35",
+         width: int = BOX_W, title_right: str = "") -> str:
+    """Generic titled box.  Title on left, optional metadata on right.
+    Body lines are taken verbatim (caller wraps if needed)."""
+    inner = width - 2
+    title_text = f" {title} " if title else ""
+    right_text = f" {title_right} " if title_right else ""
+    used = len(title_text) + len(right_text)
+    fill = max(2, inner - used)
+    top = (f"\033[{color}m╭{'─'*1}\033[0m\033[1m{title_text}\033[0m"
+           f"\033[{color}m{'─'*fill}\033[0m"
+           f"\033[1m{right_text}\033[0m"
+           f"\033[{color}m{'─'*1}╮\033[0m")
+    out = [top]
+    for ln in body_lines:
+        vis = _visible_len(ln)
+        pad = max(0, inner - 2 - vis)
+        out.append(f"\033[{color}m│\033[0m {ln}{' ' * pad} \033[{color}m│\033[0m")
+    out.append(f"\033[{color}m╰{'─'*inner}╯\033[0m")
+    return "\n".join(out)
+
+
+def turn_box(turn_no: int, target: str, agent_role: str, model: str,
+             verified: int, unverified: int, techniques: int,
+             node_id: str, width: int = BOX_W) -> str:
+    """v7.2 — header box for each agent turn."""
+    spec = AGENT_SPECS.get(agent_role, AGENT_SPECS["recon"])
+    target_short = (target[:18] + "…") if len(target) > 19 else target
+    metas = [
+        f"target \033[36m{target_short}\033[0m",
+        f"node \033[97m{node_id or '—'}\033[0m",
+        f"\033[32m✓{verified}\033[0m\033[90m/\033[33m?{unverified}\033[0m",
+        f"\033[31mATT&CK ×{techniques}\033[0m",
+        f"\033[90m{model}\033[0m",
+    ]
+    body = ["  " + "  \033[90m·\033[0m  ".join(metas),
+            f"  \033[{spec['color']}m\033[1m{spec['icon']} {spec['name']}\033[0m"]
+    return _box(f"TURN {turn_no}", body, color="35",
+                width=width, title_right=f"v{VERSION}")
+
+
+def thought_card(thought: str, agent_role: str, width: int = BOX_W) -> str:
+    """v7.2 — boxed agent thought block."""
+    spec = AGENT_SPECS.get(agent_role, AGENT_SPECS["recon"])
+    inner = width - 4
+    lines = _wrap_for_box(thought, inner)
+    if not lines:
+        lines = ["(no reasoning produced)"]
+    body = []
+    for ln in lines:
+        body.append(f"\033[{spec['color']}m▎\033[0m \033[90m\033[3m{ln}\033[0m")
+    return _box("THOUGHT", body, color=spec["color"], width=width)
+
+
+def dispatch_card(tool: str, shell_str: str, attack_id: str = "",
+                  attack_name: str = "", remap_note: str = "",
+                  width: int = BOX_W) -> str:
+    """v7.2 — boxed structured tool dispatch."""
+    inner = width - 4
+    body = [f"  \033[36m{tool}\033[0m \033[90m→\033[0m"]
+    for ln in _wrap_for_box(shell_str, inner - 2):
+        body.append(f"  \033[97m{ln}\033[0m")
+    if remap_note:
+        body.append(f"  \033[90m\033[3m{remap_note}\033[0m")
+    title_right = ""
+    if attack_id:
+        title_right = f"{attack_id} {attack_name[:22]}"
+    return _box("DISPATCH", body, color="36", width=width,
+                title_right=title_right)
+
+
+def command_card(shell_str: str, conf: str = "green", attack_id: str = "",
+                 attack_name: str = "", verify: bool = False,
+                 width: int = BOX_W) -> str:
+    """v7.2 — proposed command, with confidence pill inline."""
+    inner = width - 4
+    pill_map = {
+        "green":  "\033[42m\033[97m\033[1m GREEN ▶ \033[0m",
+        "yellow": "\033[43m\033[30m\033[1m YELLOW · \033[0m",
+        "red":    "\033[41m\033[97m\033[1m RED ✕ \033[0m",
+    }
+    pill = pill_map.get(conf, "\033[100m\033[97m  ?  \033[0m")
+    body = []
+    for ln in _wrap_for_box(shell_str, inner - 2):
+        body.append(f"  \033[97m\033[1m{ln}\033[0m")
+    body.append("")
+    body.append(f"  conf: {pill}")
+    title = "VERIFICATION" if verify else "COMMAND"
+    color = "31" if verify else "35"
+    title_right = ""
+    if attack_id:
+        title_right = f"{attack_id} {attack_name[:22]}"
+    return _box(title, body, color=color, width=width,
+                title_right=title_right)
+
+
+def result_box(output: str, *, lines_shown: int = 12,
+               width: int = BOX_W) -> str:
+    """v7.2 — boxed command result, with truncation indicator."""
+    inner = width - 4
+    raw_lines = output.splitlines()
+    shown = raw_lines[:lines_shown]
+    truncated = len(raw_lines) > lines_shown
+    body: List[str] = []
+    for ln in shown:
+        # Truncate per-line at inner-2 visible chars
+        vis = _visible_len(ln)
+        if vis > inner - 2:
+            ln = ln[:inner - 4] + "…"
+        body.append(f"  {ln}")
+    if truncated:
+        body.append(f"  \033[90m\033[3m… +{len(raw_lines) - lines_shown} "
+                    f"more line(s) (full output stored for AI context)\033[0m")
+    if not body:
+        body = ["  \033[90m(no output)\033[0m"]
+    return _box("RESULT", body, color="32", width=width)
+
+
+def error_alert(title: str, message: str, hint: str = "",
+                width: int = BOX_W) -> str:
+    """v7.2 — bold red boxed alert for blocked / failed states."""
+    inner = width - 4
+    body: List[str] = []
+    for ln in _wrap_for_box(message, inner - 2):
+        body.append(f"  \033[31m{ln}\033[0m")
+    if hint:
+        body.append("")
+        for ln in _wrap_for_box(hint, inner - 2):
+            body.append(f"  \033[33m\033[1m▸\033[0m \033[97m{ln}\033[0m")
+    return _box(f"⛔ {title}", body, color="31", width=width)
+
+
+def findings_card(new_count: int, items: List[str], width: int = BOX_W) -> str:
+    """v7.2 — boxed summary of newly extracted findings from one cmd."""
+    inner = width - 4
+    body: List[str] = []
+    for it in items[:10]:
+        if _visible_len(it) > inner - 2:
+            it = it[:inner - 4] + "…"
+        body.append(f"  {it}")
+    if len(items) > 10:
+        body.append(f"  \033[90m… +{len(items) - 10} more\033[0m")
+    if not body:
+        body = ["  \033[90m(no extractable findings this turn)\033[0m"]
+    return _box(f"FINDINGS +{new_count}", body, color="32", width=width)
+
+
 def thinking_indicator(model_name: str = "") -> str:
     """v7.1 — single-line indicator shown while LLM is thinking."""
     suffix = f" \033[90m· {model_name}\033[0m" if model_name else ""
@@ -1980,7 +2345,7 @@ def thinking_indicator(model_name: str = "") -> str:
 
 
 def boot_sequence_lines() -> List[str]:
-    """v7.1 — cinematic boot lines printed on startup."""
+    """v7.2 — cinematic boot lines printed on startup."""
     graph_glyph = "\033[32m✓\033[0m" if HAS_NETWORKX else "\033[33m⚠\033[0m"
     graph_msg = ("\033[32mnetworkx ready\033[0m" if HAS_NETWORKX else
                  "\033[33mnetworkx missing — disabled\033[0m")
@@ -1992,6 +2357,7 @@ def boot_sequence_lines() -> List[str]:
         f"\033[90m   [boot]\033[0m \033[32m✓\033[0m  loading {len(MITRE_TECHNIQUES)} ATT&CK technique mappings",
         f"\033[90m   [boot]\033[0m {graph_glyph}  attack graph: {graph_msg}",
         "\033[90m   [boot]\033[0m \033[32m✓\033[0m  smart-context manager online",
+        "\033[90m   [boot]\033[0m \033[32m✓\033[0m  loop-breaker + sudo-retry armed",
         "\033[90m   [boot]\033[0m \033[32m✓\033[0m  Groq provider chain primed",
     ]
 
@@ -2117,7 +2483,7 @@ class ToolBuilder:
 
     @staticmethod
     def nmap(target: str, ports: Optional[str] = None,
-             scripts: Optional[str] = None, version: bool = False,
+             scripts: Optional[Any] = None, version: bool = False,
              os_detect: bool = False, fast: bool = False,
              stealth: bool = False, top_ports: Optional[int] = None,
              udp: bool = False, min_rate: Optional[int] = None,
@@ -2132,19 +2498,62 @@ class ToolBuilder:
              data_length: Optional[int] = None,
              fragment: bool = False,
              script_args: Optional[str] = None,
-             extra_args: Optional[str] = None) -> str:
+             extra_args: Optional[str] = None,
+             # v7.2 — accept synonyms forwarded from KWARG_SYNONYMS
+             _scan_type: Optional[str] = None,    # 'syn'|'connect'|'udp'|'ack'
+             _open_only: bool = False) -> str:
+        # v7.2 — normalise `scripts` if it arrived as a list / dict / weird repr.
+        # Common LLM mistake: emits ["default"] which used to render as
+        # --script=['default']  (Python list repr).  Always end up with a
+        # comma-joined string.
+        if scripts is not None:
+            if isinstance(scripts, (list, tuple, set)):
+                scripts = ",".join(str(x).strip() for x in scripts if str(x).strip())
+            elif isinstance(scripts, dict):
+                scripts = ",".join(str(x).strip() for x in scripts.keys())
+            else:
+                s = str(scripts).strip()
+                # Strip stray python-list/json brackets and quotes
+                if (s.startswith("[") and s.endswith("]")) or \
+                   (s.startswith("(") and s.endswith(")")):
+                    s = s[1:-1]
+                s = s.replace("'", "").replace('"', "").strip()
+                scripts = s
+            if not scripts:
+                scripts = None
+
         parts = ["nmap"]
         if stealth:
             parts.extend(["-T1", "--scan-delay", "5s"])
-        elif timing is not None and 0 <= timing <= 5:
-            parts.append(f"-T{timing}")
+        elif timing is not None and 0 <= int(timing) <= 5:
+            parts.append(f"-T{int(timing)}")
         elif fast:
             parts.append("-T4")
         if min_rate:
             parts.extend(["--min-rate", str(min_rate)])
+
+        # v7.2 — explicit scan_type override beats heuristics
+        scan_flag = None
+        if _scan_type:
+            stype = str(_scan_type).lower().strip().lstrip("-").lstrip("s")
+            scan_flag_map = {
+                "syn": "-sS", "ss": "-sS",
+                "connect": "-sT", "tcp": "-sT", "st": "-sT",
+                "udp": "-sU", "su": "-sU",
+                "ack": "-sA", "sa": "-sA",
+                "fin": "-sF", "sf": "-sF",
+                "null": "-sN", "sn_scan": "-sN",
+                "version": "-sV", "sv": "-sV",
+            }
+            scan_flag = scan_flag_map.get(stype)
+
         # ping/host-discovery flags (any of ping_scan/sn → -sn)
         if ping_scan or sn:
             parts.append("-sn")
+        elif scan_flag:
+            parts.append(scan_flag)
+            if scan_flag == "-sU":
+                udp = True
         elif udp:
             parts.append("-sU")
         else:
@@ -2170,11 +2579,13 @@ class ToolBuilder:
         if top_ports and not (ping_scan or sn):
             parts.extend(["--top-ports", str(top_ports)])
         elif ports and not (ping_scan or sn):
-            parts.extend(["-p", ports])
+            parts.extend(["-p", str(ports)])
+        if _open_only:
+            parts.append("--open")
         if output_file:
             parts.extend(["-oN", output_file])
         if extra_args:
-            parts.append(extra_args)
+            parts.append(str(extra_args))
         parts.append(target)
         return " ".join(parts)
 
@@ -2463,47 +2874,166 @@ TOOL_DISPATCH = {
 }
 
 
+# v7.2 — primary binary lookup per tool name.  Used by dispatch to do a
+# pre-flight `which` check before generating the shell string.  This
+# stops the LLM looping on "rustscan: not found"-style failures.
+TOOL_BINARY = {
+    "nmap":              "nmap",
+    "rustscan":          "rustscan",
+    "masscan":           "masscan",
+    "gobuster_dir":      "gobuster",
+    "feroxbuster":       "feroxbuster",
+    "gobuster_vhost":    "gobuster",
+    "ffuf":              "ffuf",
+    "whatweb":           "whatweb",
+    "nikto":             "nikto",
+    "nuclei":            "nuclei",
+    "hydra":             "hydra",
+    "sqlmap":            "sqlmap",
+    "searchsploit":      "searchsploit",
+    "smbclient_list":    "smbclient",
+    "crackmapexec":      None,  # special: nxc OR crackmapexec, handled below
+    "enum4linux":        None,  # enum4linux OR enum4linux-ng
+    "hashcat":           "hashcat",
+    "hashid":            "hashid",
+    "curl_basic":        "curl",
+    "kerbrute_userenum": "kerbrute",
+    "impacket_asreproast":   "impacket-GetNPUsers",
+    "impacket_kerberoast":   "impacket-GetUserSPNs",
+    "impacket_secretsdump":  "impacket-secretsdump",
+    "msfvenom_payload":  "msfvenom",
+    "sslscan":           "sslscan",
+    "testssl":           "testssl.sh",
+    "dnsrecon":          "dnsrecon",
+    "theharvester":      "theHarvester",
+}
+
+
+def _tool_binary_present(tool_name: str) -> Tuple[bool, str]:
+    """Return (present, suggested_install_or_alt).  v7.2."""
+    if tool_name == "crackmapexec":
+        if cmd_exists("nxc") or cmd_exists("crackmapexec"):
+            return (True, "")
+        return (False, "Install: pipx install netexec  (or apt install crackmapexec)")
+    if tool_name == "enum4linux":
+        if cmd_exists("enum4linux-ng") or cmd_exists("enum4linux"):
+            return (True, "")
+        return (False, "Install: apt install enum4linux-ng")
+    binary = TOOL_BINARY.get(tool_name)
+    if binary is None:
+        # Unknown — be permissive
+        return (True, "")
+    if cmd_exists(binary):
+        return (True, "")
+    # A few common alternatives we can suggest
+    alt_map = {
+        "rustscan":   "Use 'nmap' instead — same surface, no extra install.",
+        "masscan":    "Use 'nmap --min-rate 5000' instead — slower but no install.",
+        "feroxbuster":"Use 'gobuster_dir' instead.",
+        "nuclei":     "Use 'nikto' or curl-based checks instead.",
+        "kerbrute":   "Install: go install github.com/ropnop/kerbrute@latest",
+        "testssl.sh": "Use 'sslscan' instead.",
+    }
+    alt = alt_map.get(tool_name) or alt_map.get(binary) or f"Install: apt install {binary}"
+    return (False, alt)
+
+
+def _apply_kwarg_synonyms(name: str, args: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """Map common LLM-emitted synonyms to the real builder param names.
+    Returns (cleaned_args, list_of_remappings_done) for visibility."""
+    syn_map = KWARG_SYNONYMS.get(name, {})
+    remapped: List[str] = []
+    out: Dict[str, Any] = {}
+    for k, v in args.items():
+        if k in syn_map:
+            real = syn_map[k]
+            if real is None:
+                # silent drop — this is a recognised no-op alias
+                remapped.append(f"{k}=<dropped>")
+                continue
+            # Avoid clobbering an explicit real-name arg
+            if real not in args:
+                out[real] = v
+                remapped.append(f"{k}→{real}")
+            else:
+                # both supplied — prefer the canonical one already present
+                remapped.append(f"{k}=<duplicate of {real}, ignored>")
+        else:
+            out[k] = v
+    return (out, remapped)
+
+
 def dispatch_tool(name: str, args_json: str) -> Tuple[Optional[str], Optional[str]]:
     """Resolve a [TOOL]/[ARGS] pair into a shell command.
 
-    Returns (shell_string, None) on success, (None, error_msg) on failure.
-    v7.1: drops unknown kwargs gracefully (with a warning in the error
-    field) rather than failing outright — many small LLMs emit args that
-    don't exactly match the signature.
+    Returns (shell_string, msg) tuple:
+      • (shell, None)         — clean success
+      • (shell, "NOTE: ...")  — success with a note (e.g. synonyms remapped)
+      • (None, "ERROR: ...")  — hard failure; caller MUST feed this back
+                                 to the LLM in the next prompt so it can
+                                 correct rather than loop.
     """
     if name not in TOOL_DISPATCH:
         available = ", ".join(sorted(TOOL_DISPATCH.keys()))
         return (None,
-                f"Unknown tool '{name}'. Available: {available}. "
+                f"ERROR: unknown tool '{name}'. Available: {available}. "
                 f"Use [CMD] for ad-hoc commands.")
+
+    # v7.2 — pre-flight binary check
+    present, alt = _tool_binary_present(name)
+    if not present:
+        return (None,
+                f"ERROR: tool '{name}' not installed on this system. "
+                f"{alt}  Pivot to a different tool or use [CMD] with "
+                f"something already available.")
 
     try:
         args = json.loads(args_json) if args_json else {}
     except json.JSONDecodeError as e:
-        return (None, f"Bad JSON in [ARGS] for {name}: {e}. "
-                      f"Example: [ARGS]{{\"target\":\"10.0.0.5\"}}[/ARGS]")
+        return (None,
+                f"ERROR: bad JSON in [ARGS] for {name}: {e}. "
+                f"Example: [ARGS]{{\"target\":\"10.0.0.5\"}}[/ARGS]")
 
     if not isinstance(args, dict):
-        return (None, f"[ARGS] must be a JSON object, got {type(args).__name__}")
+        return (None,
+                f"ERROR: [ARGS] must be a JSON object, got "
+                f"{type(args).__name__}")
 
-    # v7.1 — filter out kwargs that aren't in the builder signature
-    import inspect
+    # v7.2 — apply known synonyms first
+    args, remapped = _apply_kwarg_synonyms(name, args)
+
+    # Now check for kwargs that are STILL unknown after synonym mapping.
     fn = TOOL_DISPATCH[name]
     try:
         sig = inspect.signature(fn)
+        # Builder methods may use _foo "private" params for synonym
+        # forwarding (e.g. _scan_type).  These are valid kwargs.
         valid = set(sig.parameters.keys())
-        # Identify dropped kwargs for user feedback (not fatal)
-        unknown = [k for k in args.keys() if k not in valid]
-        if unknown:
-            args = {k: v for k, v in args.items() if k in valid}
-            # We'll continue with the filtered set but log the drop
-            # via a side-channel in the returned shell string's prefix
-            # — actually we just return success and rely on the caller
-            # to optionally log.  The error field will hold a soft note.
-        else:
-            unknown = []
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD
+                             for p in sig.parameters.values())
+        unknown = [k for k in args.keys() if k not in valid] if not accepts_kwargs else []
     except (ValueError, TypeError):
         unknown = []
+
+    if unknown:
+        # Hard error fed back to LLM with the actual valid args listed
+        try:
+            sig = inspect.signature(fn)
+            valid_list = []
+            for pname, p in sig.parameters.items():
+                if pname.startswith("_"):
+                    continue  # hidden synonym slots
+                if p.default is inspect.Parameter.empty:
+                    valid_list.append(pname)
+                else:
+                    valid_list.append(f"{pname}={p.default!r}")
+            valid_str = ", ".join(valid_list)
+        except Exception:
+            valid_str = "(introspection failed)"
+        return (None,
+                f"ERROR: {name} got unknown arg(s): {', '.join(unknown)}. "
+                f"Valid args: {valid_str}. "
+                f"Use [CMD] if {name} doesn't fit your need.")
 
     try:
         shell_str = fn(**args)
@@ -2512,21 +3042,22 @@ def dispatch_tool(name: str, args_json: str) -> Tuple[Optional[str], Optional[st
         try:
             sig = inspect.signature(fn)
             required = [p for p, info in sig.parameters.items()
-                        if info.default is inspect.Parameter.empty]
-            return (None, f"Bad args for {name}: {e}. Required: "
-                          f"{', '.join(required) if required else '(none)'}. "
-                          f"Use [CMD] if {name} doesn't fit.")
+                        if info.default is inspect.Parameter.empty
+                        and not p.startswith("_")]
+            return (None,
+                    f"ERROR: bad args for {name}: {e}. Required: "
+                    f"{', '.join(required) if required else '(none)'}.")
         except Exception:
-            return (None, f"Bad args for {name}: {e}")
+            return (None, f"ERROR: bad args for {name}: {e}")
     except Exception as e:
-        return (None, f"{name} builder error: {e}")
+        return (None, f"ERROR: {name} builder error: {e}")
 
     if not shell_str or not isinstance(shell_str, str):
-        return (None, f"{name} returned no command string")
+        return (None, f"ERROR: {name} returned no command string")
 
-    # Soft-warn for dropped kwargs (returns success but logs a note)
-    if unknown:
-        return (shell_str, f"NOTE: dropped unknown kwarg(s): {', '.join(unknown)}")
+    # Soft note for remappings (success path)
+    if remapped:
+        return (shell_str, f"NOTE: arg synonyms remapped: {', '.join(remapped)}")
 
     return (shell_str, None)
 
@@ -2535,13 +3066,15 @@ def tool_registry_for_prompt() -> str:
     """Compact registry summary so the LLM knows what's available
     structured.  Inspects each builder's signature to surface the
     expected args without us hardcoding it twice."""
-    import inspect
     lines = ["STRUCTURED TOOLS (use [TOOL]name[/TOOL][ARGS]json[/ARGS]):"]
     for name, fn in sorted(TOOL_DISPATCH.items()):
         try:
             sig = inspect.signature(fn)
             params = []
             for pname, p in sig.parameters.items():
+                # v7.2 — hide private synonym-forwarding params
+                if pname.startswith("_"):
+                    continue
                 if p.default is inspect.Parameter.empty:
                     params.append(pname)
                 else:
@@ -3703,23 +4236,60 @@ class AthenaSession:
                 pass
 
     def _run_boot_check(self):
-        if os.path.exists(BOOT_LOCK):
-            return
+        # v7.2 — auto-expire the boot lock after BOOT_LOCK_TTL_SECONDS
+        try:
+            if os.path.exists(BOOT_LOCK):
+                age = time.time() - os.path.getmtime(BOOT_LOCK)
+                if age < BOOT_LOCK_TTL_SECONDS:
+                    return
+        except Exception:
+            pass
+
         print()
-        say_athena("Boot check...")
-        result = subprocess.run(
-            "apt list --upgradable 2>/dev/null",
-            shell=True, capture_output=True, text=True
-        )
-        upgrades = result.stdout.lower()
-        threats = [p for p in BANNED_UPGRADE_PACKAGES if p in upgrades]
-        if threats:
-            print(f"\033[33m   UI THREAT BLOCKED: {', '.join(threats)}\033[0m")
+        say_athena("Boot check…")
+
+        # Pull upgradable list (best-effort; non-fatal if apt unavailable)
+        try:
+            result = subprocess.run(
+                "apt list --upgradable 2>/dev/null",
+                shell=True, capture_output=True, text=True, timeout=15
+            )
+            upgrades = result.stdout.lower()
+        except Exception:
+            upgrades = ""
+
+        # v7.2 — only flag a UI-package upgrade as a "threat" if the
+        # package is ACTUALLY INSTALLED on this system.  Substring
+        # matching alone produces false positives like 'xfce' matching
+        # 'xfce4-something' on a phone where xfce was never installed.
+        confirmed_threats: List[str] = []
+        for p in BANNED_UPGRADE_PACKAGES:
+            if p not in upgrades:
+                continue
+            try:
+                # dpkg-query returns rc 0 when at least one matching
+                # package is installed (state starts with 'i').
+                check = subprocess.run(
+                    f"dpkg-query -W -f='${{Status}}\\n' '{p}*' 2>/dev/null "
+                    f"| grep -q '^install ok installed'",
+                    shell=True, timeout=5
+                )
+                if check.returncode == 0:
+                    confirmed_threats.append(p)
+            except Exception:
+                # If dpkg-query failed for some reason, be conservative
+                # and DON'T flag — better than false alarms.
+                continue
+
+        if confirmed_threats:
+            say_warn(f"UI threat blocked: {', '.join(confirmed_threats)} "
+                     f"have upgrades pending — apt upgrade is banned.")
         else:
-            print("\033[32m   System OK\033[0m")
+            say_ok("System OK")
+
         try:
             with open(BOOT_LOCK, "w") as f:
-                f.write("ok")
+                f.write(f"ok {datetime.datetime.now().isoformat()}")
         except Exception:
             pass
 
@@ -3945,6 +4515,15 @@ class AthenaSession:
                     return True
         return False
 
+    def _needs_sudo_retry(self, output: str) -> bool:
+        """v7.2 — scan command output for permission-failure markers
+        that indicate the command would have worked with sudo.  Used
+        to offer a one-tap retry after a non-sudo command fails."""
+        if not output:
+            return False
+        lo = output.lower()
+        return any(marker in lo for marker in SUDO_RETRY_MARKERS)
+
     def _prime_sudo(self) -> bool:
         """Prompt the user for their sudo password ONCE per session
         (via getpass, no echo) and store it in memory.  After this,
@@ -4029,9 +4608,11 @@ class AthenaSession:
 
     def run_command(self, cmd: str, label: str = "EXEC") -> str:
         if self._is_destructive(cmd):
-            print(f"\n\033[31m   ⛔ DESTRUCTIVE COMMAND REFUSED:\033[0m {cmd}")
-            print(f"\033[31m   Athena will not run anything that wipes data, "
-                  f"kills the system, or creates fork bombs.\033[0m")
+            print()
+            print(error_alert(
+                "DESTRUCTIVE COMMAND REFUSED", cmd,
+                hint="Athena will not run anything that wipes data, "
+                     "kills the system, or creates fork bombs."))
             self._log(f"[DESTRUCTIVE REFUSED] {cmd}")
             return EXEC_DESTRUCTIVE
 
@@ -4040,16 +4621,20 @@ class AthenaSession:
                        self.target_info.get("domain") or "")
         scope_ok, scope_reason = self.scope.check(cmd, target_hint=target_hint)
         if not scope_ok:
-            print(f"\n\033[31m   🚫 OUT OF SCOPE — refused:\033[0m {cmd}")
-            print(f"\033[31m   Reason: {scope_reason}\033[0m")
-            print(f"\033[33m   Edit ~/.athena/scope.json to adjust.\033[0m")
+            print()
+            print(error_alert(
+                "OUT OF SCOPE — REFUSED",
+                f"{cmd}\n\nReason: {scope_reason}",
+                hint=f"Edit ~/.athena/scope.json to adjust engagement scope."))
             self._log(f"[OUT-OF-SCOPE] {cmd} -- {scope_reason}")
             return EXEC_REJECTED
 
         is_interactive, fix = self._is_interactive(cmd)
         if is_interactive:
-            print(f"\n\033[31m   INTERACTIVE BLOCKED:\033[0m {cmd}")
-            print(f"\033[33m   Fix: {fix}\033[0m")
+            print()
+            print(error_alert(
+                "INTERACTIVE COMMAND BLOCKED", cmd,
+                hint=f"Fix: {fix}"))
             self._log(f"[INTERACTIVE BLOCKED] {cmd}")
             return EXEC_INTERACTIVE_BLOCKED
 
@@ -4067,17 +4652,26 @@ class AthenaSession:
             self.attack_techniques_used[tid]["count"] += 1
             self.attack_techniques_used[tid]["commands"].append(cmd[:120])
 
-        # v7.1 — visual: command suggestion card with side rail.
-        # The COMMAND comes from the AI agent, but the framework is
-        # PRESENTING it for confirmation — so we frame it as such.
-        label_color = "31" if label == "VERIFY" else "35"
-        rail = f"\033[{label_color}m▌\033[0m"
-        verify_tag = " \033[31m\033[1m[VERIFICATION]\033[0m" if label == "VERIFY" else ""
+        # v7.2 — boxed command card.  Shows the command, ATT&CK tag,
+        # and confidence pill all in one panel.  Replaces the v7.1
+        # inline rail.
+        is_verify = (label == "VERIFY")
+        att_id = attack_tag[0] if attack_tag else ""
+        att_name = attack_tag[1] if attack_tag else ""
+        # Pull the most recent confidence captured by think_turn for the
+        # active node (defaults to green if unknown).
+        active_for_conf = self.ptt.find_in_progress()
+        conf = active_for_conf.confidence if active_for_conf else "green"
+        # If we've failed N times on this node, override to red
+        if active_for_conf and active_for_conf.attempts >= 2 and conf == "green":
+            conf = "yellow"
+        if active_for_conf and active_for_conf.attempts >= NODE_ATTEMPT_LIMIT - 1:
+            conf = "red"
         print()
-        print(f"{rail} \033[{label_color}m{_C_BOLD}proposed command{verify_tag}{_C_RESET}{attack_label}")
-        print(f"{rail} \033[97m{cmd}\033[0m")
+        print(command_card(cmd, conf=conf, attack_id=att_id,
+                           attack_name=att_name, verify=is_verify))
         print()
-        self._log(f"\n[CMD-{label}]{' '+attack_tag[0] if attack_tag else ''}\n{cmd}")
+        self._log(f"\n[CMD-{label}]{' '+att_id if att_id else ''}\n{cmd}")
 
         try:
             raw = input(
@@ -4119,10 +4713,22 @@ class AthenaSession:
             actual_cmd = self._wrap_sudo_with_password(cmd)
             sudo_pw_input = (self._sudo_password or "") + "\n"
 
-        print(f"\n   \033[100m\033[97m\033[1m  ▶ EXECUTING  \033[0m  "
-              f"\033[90m\033[3mCtrl+C aborts this command only\033[0m\n")
+        # v7.2 — pick a timeout based on the command pattern.  Long
+        # scans get a generous ceiling; everything else caps at 5 min
+        # so a hanging command can't lock the session forever.
+        cmd_timeout = DEFAULT_COMMAND_TIMEOUT
+        for pat, t in COMMAND_TIMEOUTS:
+            if re.search(pat, cmd, re.IGNORECASE):
+                cmd_timeout = t
+                break
+
+        print()
+        print(f"   \033[100m\033[97m\033[1m  ▶ EXECUTING  \033[0m  "
+              f"\033[90m\033[3mtimeout={cmd_timeout}s · "
+              f"Ctrl+C aborts this command only\033[0m\n")
         output_lines = []
         proc = None
+        timed_out = False
         is_exploit = any(kw in cmd.lower() for kw in
                         ["exploit", "msfconsole", "searchsploit -m",
                          "msfvenom", "/tmp/exploit.rc"])
@@ -4151,13 +4757,33 @@ class AthenaSession:
                     proc.stdin.close()
                 except Exception:
                     pass
-            for line in proc.stdout:
+
+            # v7.2 — non-blocking read loop bounded by cmd_timeout.
+            start_t = time.time()
+            for line in iter(proc.stdout.readline, ""):
                 # Strip the password-prompt line if it leaks through stderr
                 if line.strip().startswith("[sudo] password for"):
                     continue
                 print(line, end="")
                 output_lines.append(line)
-            proc.wait()
+                if (time.time() - start_t) > cmd_timeout:
+                    timed_out = True
+                    break
+            if timed_out:
+                # Kill the process group cleanly
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                output_lines.append(f"\n[COMMAND TIMED OUT after {cmd_timeout}s — killed]\n")
+                print(f"\n\033[31m   ⏱  Command timed out at {cmd_timeout}s "
+                      f"and was killed.\033[0m")
+            else:
+                proc.wait()
         except KeyboardInterrupt:
             print("\n\033[33m   Command aborted by user — returning to Athena\033[0m")
             if proc:
@@ -4176,6 +4802,29 @@ class AthenaSession:
             return err
 
         raw_output = "".join(output_lines)
+        rc = proc.returncode if proc else -1
+
+        # v7.2 — if command failed with a permissions/raw-socket marker
+        # AND wasn't already wrapped in sudo, offer a one-tap retry.
+        if (rc != 0 and not self._command_needs_sudo(cmd)
+                and self._needs_sudo_retry(raw_output)
+                and not self._sudo_skip_session):
+            print()
+            print(error_alert(
+                "PERMISSION DENIED — needs root",
+                f"`{cmd[:160]}` failed without sudo.",
+                hint="Press y to re-run prefixed with sudo (one-time, "
+                     "uses cached password)."))
+            try:
+                ans = input(f"   {kbd('y')} retry as sudo   {kbd('n')} keep failure  › ")
+            except (EOFError, KeyboardInterrupt):
+                ans = "n"
+            if self._normalize_choice(ans) == "y":
+                # Recursively run the sudo-prefixed version through the
+                # same gate.  We tag the label so the agent loop knows
+                # this isn't a fresh proposal.
+                say_sys("retrying with sudo prefix…", color="33")
+                return self.run_command("sudo " + cmd, label=label + "-SUDO")
 
         # Auto-CVE lookup on recon-type commands
         if any(kw in cmd for kw in ["nmap", "whatweb", "smbclient",
@@ -4202,12 +4851,32 @@ class AthenaSession:
         # Source-tagged finding extraction — ONLY on raw subprocess output
         active = self.ptt.find_in_progress()
         active_id = active.nid if active else self.ptt.root_id
+        findings_before = len(self.ptt.findings)
         new_count = extract_findings_from_stdout(
             raw_output, source_cmd=cmd, ptt=self.ptt,
             active_node_id=active_id,
         )
         if new_count > 0:
-            print(f"\n\033[32m   ↳ {new_count} new finding(s) extracted\033[0m")
+            # v7.2 — boxed findings card with the actual extracted values
+            new_findings = self.ptt.findings[findings_before:]
+            items = []
+            for f in new_findings:
+                icon_map = {
+                    "ip": "🌐", "port": "🔌", "user": "👤",
+                    "hash": "🔐", "hash_ntlm": "🔐", "krb_hash": "🎫",
+                    "ntlmv2": "🔐", "cred": "🔑", "cve": "💥",
+                    "svc": "⚙", "domain": "🏷", "url": "🔗",
+                    "exposed_path": "⚠", "smb_share": "📂",
+                    "email": "📧", "ssh_key": "🗝", "aws_key": "☁",
+                }
+                icon = icon_map.get(f.ftype, "•")
+                tag = f" \033[36m{f.attack_id}\033[0m" if f.attack_id else ""
+                items.append(
+                    f"{icon}  \033[97m{f.ftype:<12}\033[0m "
+                    f"\033[36m{f.value[:42]}\033[0m{tag}"
+                )
+            print()
+            print(findings_card(new_count, items))
             # v7.1 — feed new findings into attack graph
             self._sync_graph_from_recent_findings(new_count)
             # v7.1 — if creds appeared, queue them for fanout
@@ -4239,10 +4908,12 @@ class AthenaSession:
 
         Per operator instruction: ALWAYS goes through y/n gate.
         """
-        print(f"\n\033[31m   ╔═══ POC VERIFICATION ═══╗\033[0m")
-        print(f"\033[97m   Claim: {finding_type}={finding_value}\033[0m")
-        print(f"\033[33m   Verifier will attempt to confirm this is real.\033[0m")
-        print(f"\033[31m   ╚════════════════════════╝\033[0m")
+        print()
+        print(_box(
+            "PoC VERIFICATION",
+            [f"  Claim: \033[97m{finding_type}={finding_value[:48]}\033[0m",
+             f"  Verifier will attempt to confirm this is real."],
+            color="31"))
 
         result = self.run_command(verify_cmd, label="VERIFY")
         if result in (EXEC_REJECTED, EXEC_DESTRUCTIVE,
@@ -4259,12 +4930,19 @@ class AthenaSession:
             "not found", "no such", "command not found",
         ]
         if any(m in result_lower for m in fail_markers):
-            print(f"\033[31m   ✗ Verification FAILED — "
-                  f"{finding_type}={finding_value} stays unverified\033[0m")
+            print()
+            print(_box(
+                "✗ VERIFICATION FAILED",
+                [f"  {finding_type}={finding_value[:48]} stays unverified"],
+                color="31"))
             return False
 
         if not result.strip() or result.strip() == "(no output)":
-            print(f"\033[33m   ? Verification inconclusive (empty output)\033[0m")
+            print()
+            print(_box(
+                "? VERIFICATION INCONCLUSIVE",
+                ["  Empty output. Try a different verifier."],
+                color="33"))
             return False
 
         # Promote finding to verified
@@ -4441,37 +5119,72 @@ class AthenaSession:
             self.history = self.history[-(MAX_HISTORY_MESSAGES * 2):]
         self._log(f"[AI:{agent_role}]\n{response}")
 
-        # v7.1 — TOOL dispatch: convert [TOOL]/[ARGS] → shell string
+        # v7.2 — TOOL dispatch: convert [TOOL]/[ARGS] → shell string.
+        # Hard errors are stashed on self._pending_dispatch_error so the
+        # agent loop can splice them into the next prompt — that way
+        # the LLM actually learns about its bad kwargs instead of
+        # looping the same args.
+        self._pending_dispatch_error = None
+        dispatch_remap_note = ""
         if parsed["tool"]:
             shell, msg = dispatch_tool(parsed["tool"], parsed["args"] or "{}")
             if shell:
                 parsed["cmd"] = shell
-                say_dim(f"▸ tool-dispatch  \033[36m{parsed['tool']}\033[90m → "
-                        f"\033[97m{shell[:80]}{'…' if len(shell) > 80 else ''}\033[0m")
-                if msg:  # soft warning (e.g. dropped unknown kwargs)
-                    say_warn(f"  {msg}")
+                if msg and msg.startswith("NOTE:"):
+                    dispatch_remap_note = msg
             else:
-                say_err(f"tool-dispatch failed: {msg}")
-                # If LLM also gave a [CMD] fallback, use it
+                # Hard ERROR — feed back to LLM next turn
+                self._pending_dispatch_error = (
+                    f"Your previous [TOOL]{parsed['tool']}[/TOOL] dispatch "
+                    f"failed:\n  {msg}\n"
+                    f"Either correct the args, switch tools, or fall back "
+                    f"to a [CMD] block."
+                )
                 if not parsed["cmd"]:
-                    say_dim("No [CMD] fallback either — asking LLM to retry.")
+                    parsed["cmd"] = None  # no fallback — agent loop will retry
 
-        # Pretty print — clear speaker indicators per role
-        spec = AGENT_SPECS.get(agent_role, AGENT_SPECS["recon"])
-        agent_color = spec["color"]
+        # v7.2 — failure-aware confidence.  If we've failed N times
+        # already on this node, force a yellow/red regardless of what
+        # the LLM said.
+        if active and active.attempts >= NODE_ATTEMPT_LIMIT - 1:
+            parsed["conf"] = "red"
+        elif active and active.attempts >= 2 and parsed["conf"] == "green":
+            parsed["conf"] = "yellow"
+
+        # ─── v7.2 BOXED RENDERING ──────────────────────────────────
+        target_label = (self.target_info.get("ip") or
+                        self.target_info.get("domain") or "no-target")
+        self._turn_no = getattr(self, "_turn_no", 0) + 1
+        v_count = len(self.ptt.get_verified())
+        u_count = len(self.ptt.get_unverified())
+        node_label = active.nid if active else "—"
         print()
-        # The agent's "voice line" — bold name + model on right
-        print(f"   \033[{agent_color}m{_C_BOLD}{spec['icon']}  "
-              f"{spec['name']}{_C_RESET}  "
-              f"\033[90m·\033[0m  \033[36m{self._current_model_name()}\033[0m")
-        # Sub-rule under the agent header
-        print(f"   \033[{agent_color}m{'─' * 60}\033[0m")
-        # The thought — clearly marked as the agent's reasoning
+        print(turn_box(
+            turn_no=self._turn_no,
+            target=target_label,
+            agent_role=agent_role,
+            model=self._current_model_name(),
+            verified=v_count, unverified=u_count,
+            techniques=len(self.attack_techniques_used),
+            node_id=node_label,
+        ))
         if parsed["thought"]:
-            say_thought(parsed["thought"], agent_role=agent_role, indent=3)
-
-        # Confidence indicator — pill style
-        print(f"\n   {confidence_pill(parsed['conf'])}")
+            print(thought_card(parsed["thought"], agent_role=agent_role))
+        if parsed["tool"] and parsed["cmd"]:
+            tool_attack = attack_id_for_command(parsed["cmd"])
+            t_id = tool_attack[0] if tool_attack else ""
+            t_name = tool_attack[1] if tool_attack else ""
+            print(dispatch_card(
+                tool=parsed["tool"], shell_str=parsed["cmd"],
+                attack_id=t_id, attack_name=t_name,
+                remap_note=dispatch_remap_note,
+            ))
+        elif self._pending_dispatch_error:
+            print(error_alert(
+                "TOOL DISPATCH FAILED",
+                self._pending_dispatch_error,
+                hint="The error will be fed back to the AI on the next turn.",
+            ))
 
         if active:
             self.ptt.set_confidence(active.nid, parsed["conf"])
@@ -4561,30 +5274,40 @@ class AthenaSession:
         prompt = initial_prompt
         self.current_workflow_key = workflow_key
         self.stuck_counter = 0
+        # Track success per node so workflow can't auto-complete a
+        # streak of failures (v7.2 fix).
+        self._node_success_count: Dict[str, int] = {}
 
         while True:
-            # v7.1 — coloured turn indicator instead of old status_line()
-            v_count = len(self.ptt.get_verified())
-            u_count = len(self.ptt.get_unverified())
-            active  = self.ptt.find_in_progress() or self.ptt.find_next_pending()
-            node_label = active.nid if active else "—"
-            target_label = (self.target_info.get("ip") or
-                            self.target_info.get("domain") or "no-target")
-            print()
-            print(f"   \033[90m─\033[0m \033[97m\033[1mturn\033[0m  "
-                  f"\033[90mtarget\033[0m \033[36m{target_label}\033[0m  "
-                  f"\033[90mnode\033[0m \033[97m{node_label}\033[0m  "
-                  f"\033[90mfindings\033[0m "
-                  f"\033[32m✓{v_count}\033[0m\033[90m/\033[33m?{u_count}\033[0m  "
-                  f"\033[90mATT&CK\033[0m \033[31m×{len(self.attack_techniques_used)}\033[0m  "
-                  f"\033[90m\033[3m{self._current_model_name()}\033[0m")
-            print(hr(64))
+            # v7.2 — turn header is now drawn by turn_box() inside
+            # think_turn(); no inline header needed here.
+            active = self.ptt.find_in_progress() or self.ptt.find_next_pending()
+
+            # v7.2 — if a previous turn produced a hard dispatch error,
+            # splice it into the prompt so the LLM sees its own mistake
+            # and can correct.  Without this the loop just kept emitting
+            # the same kwargs and getting silently dropped.
+            pending_err = getattr(self, "_pending_dispatch_error_to_prompt", None)
+            if pending_err:
+                prompt = (
+                    f"DISPATCH ERROR FROM YOUR PREVIOUS TURN:\n"
+                    f"{pending_err}\n\n"
+                    f"Re-issue with corrected args, switch tools, or "
+                    f"use [CMD]. Original task:\n{prompt}"
+                )
+                self._pending_dispatch_error_to_prompt = None
 
             parsed = self.think_turn(prompt, workflow_key=workflow_key)
             cmd     = parsed["cmd"]
             conf    = parsed["conf"]
             verify  = parsed["verify"]
             handoff = parsed["handoff"]
+
+            # v7.2 — propagate any fresh dispatch error from think_turn
+            # into the next iteration of this loop.
+            if getattr(self, "_pending_dispatch_error", None):
+                self._pending_dispatch_error_to_prompt = self._pending_dispatch_error
+                self._pending_dispatch_error = None
 
             if cmd is None:
                 # v7.1 — instead of bailing, retry up to 2x with a
@@ -4610,28 +5333,66 @@ class AthenaSession:
             else:
                 self._no_cmd_retries = 0  # reset on success
 
-            # Workflow done check
+            # Workflow done check — v7.2 GATED on actual progress
             if WORKFLOW_DONE in cmd.upper() or "WORKFLOW_COMPLETE" in cmd.upper():
+                # v7.2 — refuse to auto-complete a node that has zero
+                # successful commands AND zero findings.  The LLM can
+                # try to bail out of failures with WORKFLOW_COMPLETE;
+                # this gate stops that.
+                node_findings = 0
+                node_successes = 0
+                if active:
+                    node_findings = len(active.findings)
+                    node_successes = self._node_success_count.get(active.nid, 0)
+                if active and node_findings == 0 and node_successes == 0:
+                    say_warn(f"Refusing WORKFLOW_COMPLETE on node "
+                             f"[{active.nid}] — 0 findings, 0 successful "
+                             f"commands. Try a different approach.")
+                    prompt = (
+                        f"You proposed WORKFLOW_COMPLETE but node "
+                        f"[{active.nid}] {active.title} has produced no "
+                        f"successful commands and no findings yet. "
+                        f"You may not skip a node that hasn't yielded "
+                        f"any data. Take a fundamentally different "
+                        f"approach (different tool, different angle), "
+                        f"or [HANDOFF]<other_agent>[/HANDOFF] to escalate."
+                    )
+                    continue
+
                 if active:
                     self.ptt.set_status(active.nid, "done")
                 # Check if we have more pending nodes
                 nxt = self.ptt.find_next_pending()
                 if nxt:
-                    print(f"\n\033[32m   ✓ Node done — moving to "
-                          f"[{nxt.nid}] {nxt.title}\033[0m")
+                    print()
+                    print(_box(
+                        "✓ NODE COMPLETE",
+                        [f"  Moving to: \033[97m[{nxt.nid}] {nxt.title}\033[0m"],
+                        color="32"))
                     self.ptt.set_status(nxt.nid, "in_progress")
                     prompt = (f"Previous node complete.  "
                               f"Now work on: {nxt.title} (phase: {nxt.phase}). "
                               f"Output [THOUGHT][CMD][CONF].")
                     continue
                 else:
-                    print("\n\033[32m   ✓ All workflow nodes complete.\033[0m\n")
+                    print()
+                    print(_box(
+                        "✓ WORKFLOW COMPLETE",
+                        [f"  All nodes done. \033[32m{len(self.ptt.get_verified())}"
+                         f"\033[0m verified findings, "
+                         f"\033[33m{len(self.ptt.get_unverified())}\033[0m unverified."],
+                        color="32"))
                     self._log("[WORKFLOW DONE]")
                     break
 
             # Handoff request
             if handoff and handoff in AGENT_SPECS:
-                print(f"\n\033[33m   ↪ Handoff requested: {handoff}\033[0m")
+                print()
+                print(_box(
+                    "↪ HANDOFF",
+                    [f"  → {AGENT_SPECS[handoff]['icon']} "
+                     f"{AGENT_SPECS[handoff]['name']}"],
+                    color="33"))
                 # Add a sibling node for the handoff phase if reasonable
                 if active and active.parent_id:
                     self.ptt.add_node(active.parent_id,
@@ -4640,25 +5401,52 @@ class AthenaSession:
 
             # Banned check
             if self._is_banned(cmd):
-                print("\n\033[31m   Banned upgrade command blocked.\033[0m")
+                print()
+                print(error_alert(
+                    "BANNED COMMAND BLOCKED",
+                    f"`{cmd}` would change UI / system packages.",
+                    hint="Use `which`/`dpkg -l` to check tools instead. "
+                         "apt upgrade variants are permanently disabled."))
                 prompt = ("That apt upgrade variant is blocked.  Use which "
                           "or dpkg -l to check tools.  Provide alternative "
                           "with [THOUGHT][CMD][CONF].")
                 continue
 
-            # Track command for repeat detection
+            # v7.2 — Track command for repeat detection.  More aggressive
+            # than v7.1: ANY exact repeat in the last 5 commands triggers
+            # a forced agent rotation + RED conf override.  This stops
+            # the loop where dropped kwargs produced identical shells.
             cmd_norm = re.sub(r'\s+', ' ', cmd.strip().lower())
-            if cmd_norm in self.command_history[-3:]:
-                print(f"\n\033[33m   ⚠  Repeated command — telling AI to pivot\033[0m")
+            if cmd_norm in self.command_history[-5:]:
+                print()
+                print(error_alert(
+                    "LOOP DETECTED",
+                    f"You just ran this exact command. Repeating means the "
+                    f"previous result didn't change anything you can act on.",
+                    hint="Forcing pivot to a different approach now."))
                 self.stuck_counter += 1
                 if active:
                     self.ptt.increment_attempts(active.nid)
+                    self.ptt.set_confidence(active.nid, "red")
                 if self.stuck_counter >= STUCK_THRESHOLD:
                     self.stuck_counter = 0
                     self._handle_stuck()
                     break
-                prompt = (f"You already ran '{cmd}' recently.  Take a "
-                          f"DIFFERENT approach.  [THOUGHT][CMD][CONF].")
+                # v7.2 — give the LLM stronger guidance: name the command,
+                # require a *different category* of approach, and bump
+                # the agent if possible.
+                rotation_hint = ""
+                if self.current_agent == "recon":
+                    rotation_hint = " Switch from scanning to direct service interaction (whatweb, curl, nxc, smbclient)."
+                elif self.current_agent == "web":
+                    rotation_hint = " Switch from brute/fuzz to manual probing (curl with payloads) or pivot to network agent."
+                prompt = (
+                    f"LOOP-BREAKER: you already ran `{cmd}`. The result "
+                    f"didn't help. Take a FUNDAMENTALLY DIFFERENT approach: "
+                    f"different tool, different angle, different "
+                    f"specialist.{rotation_hint} Output [THOUGHT][CMD][CONF]. "
+                    f"You may [HANDOFF]<other_agent>[/HANDOFF] to escalate."
+                )
                 continue
 
             self.command_history.append(cmd_norm)
@@ -4667,8 +5455,10 @@ class AthenaSession:
 
             # Confidence handling — the pill already shows in think_turn()
             if conf == "red":
-                print(f"   \033[90m└─ skipping execution; asking AI for "
-                      f"more info-gathering instead\033[0m")
+                print()
+                print(_box("RED CONFIDENCE — execution skipped",
+                           ["  Asking AI for recon to gather missing "
+                            "context first."], color="31"))
                 prompt = ("Confidence was RED.  Propose a recon command to "
                           "gather the missing context, not the attack.  "
                           "[THOUGHT][CMD][CONF].")
@@ -4706,8 +5496,12 @@ class AthenaSession:
                 if active:
                     if active.attempts >= NODE_ATTEMPT_LIMIT:
                         self.ptt.set_status(active.nid, "dead_end")
-                        print(f"\033[33m   ✗ Node [{active.nid}] marked dead-end "
-                              f"(attempts={active.attempts})\033[0m")
+                        print()
+                        print(_box(
+                            "✗ DEAD END",
+                            [f"  Node [{active.nid}] {active.title}",
+                             f"  Marked dead-end after {active.attempts} attempts."],
+                            color="31"))
                 if self.stuck_counter >= STUCK_THRESHOLD:
                     self.stuck_counter = 0
                     self._handle_stuck()
@@ -4726,15 +5520,27 @@ class AthenaSession:
                 else:
                     break
 
-            # Successful exec — reset stuck counter
+            # v7.2 — record a successful exec for this node (used by
+            # the WORKFLOW_COMPLETE gate above).  We count any non-error
+            # return from run_command as a success at the framework
+            # level — even if the tool found nothing, the LLM at least
+            # got real output to reason from.
             self.stuck_counter = 0
+            if active:
+                self._node_success_count[active.nid] = (
+                    self._node_success_count.get(active.nid, 0) + 1)
 
             # v7.1 — flush any queued credential fanout work into PTT
             self._flush_cred_fanout()
 
             # Optional verification
             if verify:
-                print(f"\n\033[33m   AI proposed verification command.\033[0m")
+                print()
+                print(_box(
+                    "PoC VERIFICATION",
+                    ["  Agent proposed a verification command — "
+                     "running through y/n gate."],
+                    color="33"))
                 # Try to figure out which finding it's verifying — pick the
                 # most recent unverified finding from this node
                 if active:
@@ -5348,6 +6154,7 @@ def _build_banner() -> str:
     W  = "\033[97m"   # bright white logo
     G  = "\033[90m"   # grey detail
     C  = "\033[36m"   # cyan accent
+    Y  = "\033[33m"   # yellow accent
     B  = "\033[1m"    # bold
     R  = "\033[0m"    # reset
     KB = "\033[100m\033[97m"  # keycap inverse
@@ -5364,16 +6171,17 @@ def _build_banner() -> str:
         L(f"    {W}██║  ██║   ██║   ██║  ██║███████╗██║ ╚████║██║  ██║{M}       ") + f"{M}│{R}",
         L(f"    {W}╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝{M}       ") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
-        L(f"   {B}{W}AI OFFENSIVE SECURITY AGENT{R}{M}  ·  {B}{C}v7.1{R}{M}                       ") + f"{M}│{R}",
+        L(f"   {B}{W}AI OFFENSIVE SECURITY AGENT{R}{M}  ·  {B}{C}v7.2{R}{M}                       ") + f"{M}│{R}",
         L(f"   {G}Bare-metal Kali NetHunter  ·  Commander: The Priest{M}            ") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
-        L(f" {G}╭─{C} v7.1 capabilities {G}──────────────────────────────────────╮{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Tool Dispatch    {G}typed builders, no flag drift{R}        {G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}╭─{C} v7.2 highlights {G}────────────────────────────────────────╮{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Tool Dispatch    {G}synonym-aware, errors fed to LLM{R}     {G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Sudo Escalation  {G}auto-retry on permission denied{R}      {G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Loop Breaker     {G}forced pivot on repeats{R}              {G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Boxed UI         {G}every event in its own panel{R}         {G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Per-Cmd Timeouts {G}long scans capped, no hangs{R}          {G}│{M}  ") + f"{M}│{R}",
         L(f" {G}│{R}  {W}⊕ MITRE ATT&CK     {G}auto-tagged commands & findings{R}      {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Scope / RoE      {G}engagement boundary enforced{R}         {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Attack Graph     {G}networkx-backed pivot memory{R}         {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Smart Context    {G}~50% token savings, NEED-fetch{R}       {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Cred Fanout      {G}auto reuse-test across services{R}      {G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Scope · Graph    {G}RoE enforced, networkx pivots{R}        {G}│{M}  ") + f"{M}│{R}",
         L(f" {G}╰───────────────────────────────────────────────────────────╯{M}  ") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
         L(f"   {G}type  {KB} help {R}{G}  for commands  ·  {KB} workflow {R}{G}  for menus{M}     ") + f"{M}│{R}",

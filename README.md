@@ -1,183 +1,194 @@
-<div align="center">
+# Athena — AI Offensive Security Agent
 
-# Athena
+**v7.2** · Bare-metal Kali NetHunter · Commander: The Priest
 
-**AI Offensive Security Agent for Kali Linux / NetHunter**
-
-`v7.1` — single-file Python — operator-in-the-loop
-
-</div>
+Athena is an AI-driven pentesting copilot. You give it a target and an
+objective, it picks the right specialist agent, picks the right tool,
+and runs commands one at a time through a `y/n` confirmation gate. Every
+finding is regex-extracted from real subprocess output (no AI
+hallucinations), tagged with MITRE ATT&CK, and tracked in a Pentesting
+Task Tree (PTT) plus a networkx-backed attack graph.
 
 ---
 
-Athena is an AI-driven pentesting assistant that runs in your terminal, plans engagements as a hierarchical task tree, and dispatches specialist agents (recon, web, AD, privesc, credential, exfil, evasion, reporter) per phase. Every command is gated by `y/n` confirmation. Every finding is source-tagged to the exact subprocess output it came from. Out-of-scope commands are refused before execution. Reports are deliverable-grade with MITRE ATT&CK coverage tables.
+## What's new in v7.2
 
-It is not a chat wrapper around an LLM. It is a stateful agent framework with deterministic dispatch, typed tool builders, scope enforcement, an attack graph, and smart-context token discipline.
+This release is a reliability + UI overhaul fixing every bug surfaced
+during field testing of v7.1.
 
-## What v7.1 actually does
+### Reliability
 
-- **Pentesting Task Tree (PTT)** — hierarchical state with status, confidence, attempt counters, last-command tracking, and per-node attack history. Replaces the flat finding lists most LLM pentest tools use.
-- **11 specialist agents** dispatched deterministically by phase: strategist, recon, web, network, AD, linux\_privesc, windows\_privesc, credential, exfil, evasion, reporter. Each has its own persona and KB context.
-- **Source-tagged finding extraction** — regex runs on raw subprocess stdout only. Phantom findings (LLM hallucinations) cannot enter state because every finding records its originating shell command.
-- **MITRE ATT&CK auto-tagging** — 50 command patterns and 17 finding-type fallbacks map every action to a technique ID (T1046, T1110.003, T1003.006, T1558.003...). Reports include a coverage table grouped by tactic.
-- **Engagement scope / Rules of Engagement** — `~/.athena/scope.json` defines allowed CIDRs, allowed/blocked domains, and time windows. Every command's targets are checked before execution. Out-of-scope commands are refused with a clear reason. Wildcards supported (`*.target.com`).
-- **Smart context manager** — minimal context per turn (active node + verified findings + 4 history turns) saves ~50% tokens vs sending everything every turn. The LLM can request more on demand via `[NEED]ptt[/NEED]`, `[NEED]graph[/NEED]`, `[NEED]findings[/NEED]`, `[NEED]history[/NEED]`, or `[NEED]kb 4[/NEED]` and the system re-calls with the extra context attached.
-- **Attack graph** — `networkx`-backed. Hosts, services, credentials, hashes, and CVEs as nodes; `runs_on` / `works_on` / `affects` / `for_user` / `can_pivot_to` as edges. Surfaces pivot suggestions ("untested cred × N services") the LLM might miss in the flat finding list.
-- **Auto credential fanout** — when a credential verifies, the framework queues PTT subnodes for testing it across every auth-able service in the graph. Deterministic, not LLM-dependent.
-- **28 structured tool builders** — typed wrappers for nmap, rustscan, masscan, gobuster, feroxbuster, ffuf, hydra, sqlmap, hashcat, hashid, impacket-* family, kerbrute, msfvenom, nuclei, nikto, sslscan, theharvester, dnsrecon, and more. The LLM picks args, the framework constructs the shell string. Unknown args dropped gracefully with a soft warning.
-- **PoC verification queue** — claimed credentials get re-tested through a separate gate before being marked verified. Reports cleanly separate verified from unverified.
-- **Sudo handling** — password prompted once via `getpass`, kept in RAM only, fed via `sudo -S` to all subsequent privileged commands. Works regardless of TTY context.
-- **Provider chain** — 9 Groq models with automatic fallback, biggest first.
-- **23 workflows** for common engagement patterns: external recon, web app pentest, AD kill chain, container escape, lateral movement, IDS evasion, etc.
-- **Five-voice UI** — every line shows who's speaking: `⚔ priest` (you), `◈ ATHENA` (framework), `🔍 RECON` (AI agent), `▌ proposed command`, `✓` / `⚠` / `✕` for ok/warn/error.
-- **Always y/n gated** — Athena never executes anything without an explicit operator confirmation. Destructive patterns (rm -rf /, dd if=/dev/zero, fork bombs) are refused outright. System-modifying commands require double confirmation.
+- **Tool dispatch no longer silently drops kwargs.** Common LLM
+  emissions like `scan_type`, `skip_host_discovery`, `timing_template`,
+  `open_only`, `script`, `nse_scripts`, `service_version`,
+  `port_range`, `T`, etc. are now mapped to the correct builder
+  parameter via a synonym table. Truly unknown kwargs return a hard
+  `ERROR:` that gets fed back into the LLM's next prompt — so the
+  agent learns and corrects, instead of looping with the same bad args.
+- **Sudo escalation.** After a non-sudo command fails with markers
+  like `cap_net_raw`, `permission denied`, `pcap_activate`,
+  `must be root`, etc., Athena offers a one-tap retry with `sudo`
+  prefix using the in-RAM cached password.
+- **Tool availability pre-flight.** Dispatcher refuses to build a shell
+  string for a tool that isn't installed and suggests an alternative
+  (e.g. `rustscan` missing → suggests `nmap`).
+- **Script-param type safety.** `nmap.scripts` accepts list / tuple /
+  dict / repr-string and always normalises to `--script=a,b,c`. The
+  `--script=['default']` literal-list bug is dead.
+- **Loop breaker.** Same shell command twice in last 5 → forced RED
+  confidence, agent rotation hint, and a different-approach prompt.
+  Three repeats → stuck-handler picks 3 alternative angles.
+- **Workflow completion gate.** `WORKFLOW_COMPLETE` is refused on a
+  node with 0 successful commands AND 0 findings — the LLM cannot
+  bail out of a streak of failures by claiming "done".
+- **Failure-aware confidence.** Multiple attempts on a node force
+  yellow → red regardless of what the LLM self-reports.
+- **UI-threat false-positive guard.** Boot check confirms with
+  `dpkg-query` that a flagged package is actually installed before
+  warning. The boot lock auto-expires after 6 hours.
+- **Per-command timeouts.** `nmap` full-range 600s, `--top-ports`
+  90s, `hydra` 1800s, `hashcat`/`john` 3600s, default 300s. A hung
+  command can no longer freeze the session.
+
+### Visual
+
+Every event now renders as its own titled, colour-coded box:
+
+```
+┌─ TURN N · target · node · ✓v/?u · ATT&CK · model ─┐
+┌─ THOUGHT ─────────────────────────────────────────┐
+┌─ DISPATCH ─ T1046 Network Service Discovery ─────┐
+┌─ COMMAND  conf=GREEN ▶ ─ ATT&CK=T1046 ───────────┐
+┌─ FINDINGS +N ────────────────────────────────────┐
+┌─ ⛔ ERROR / PERMISSION DENIED ───────────────────┐
+```
+
+Persistent status bar still renders before each prompt.
+
+### Preserved from v7.1
+
+- Pentesting Task Tree (PTT) — hierarchical task state with
+  natural-language serialisation for the LLM.
+- 11 specialist agents (strategist · recon · web · network · ad ·
+  linux/win privesc · credential · exfil · evasion · reporter)
+  with deterministic phase-based dispatch.
+- 28 structured tool builders (typed signatures, no flag drift).
+- 200+ Kali tool registry, auto-install on demand.
+- MITRE ATT&CK auto-tagging on every command and finding (50
+  technique mappings).
+- Scope / RoE enforcement via `~/.athena/scope.json`.
+- Attack graph (networkx) with pivot suggestions.
+- Smart context manager with `[NEED]ptt|history|graph|kb N[/NEED]`
+  re-fetch protocol.
+- Auto credential fanout queue.
+- Source-tagged finding extraction (no AI hallucinations enter the
+  finding store — only raw subprocess output is parsed).
+- Groq provider chain with automatic fallback (9 models,
+  biggest → smallest).
+- Confirmation gate (`y/n/q`) on every command.
+- No on-disk persistence except scope, logs, and reports.
+
+---
 
 ## Install
 
+Tested on Kali Linux NetHunter (sdm845, Phosh). Should work on any
+Debian / Ubuntu / Arch system with python ≥ 3.10.
+
 ```bash
-git clone https://github.com/the-priest/athena5
+git clone https://github.com/the-priest/athena5.git
 cd athena5
-./install.sh
+pip install groq networkx --break-system-packages
+export GROQ_API_KEY='your_key_here'   # add to ~/.bashrc to persist
+python3 athena.py
 ```
 
-The installer:
+If `groq` install fails on a managed Python, drop the
+`--break-system-packages` flag and use a virtualenv.
 
-1. Verifies Python 3.10+
-2. Installs Python dependencies (`groq`, `networkx`)
-3. Symlinks `/usr/local/bin/athena` → the script (falls back to a `~/.bashrc` alias if no sudo)
-4. Creates `~/.athena/` for logs and scope config
-5. Prompts for `GROQ_API_KEY` if not set, writes it to `~/.bashrc`
+---
 
-## Quickstart
-
-```bash
-export GROQ_API_KEY=gsk_...
-athena
-```
-
-Set a target, then either type a free-form objective or pick a workflow:
+## Usage
 
 ```
-   ⚔ priest › find smb shares and check for ms17-010
+$ python3 athena.py
 ```
 
-```
-   ⚔ priest › workflow
-```
+You'll see the v7.2 banner, then the boot sequence, then a prompt
+to set the target (IP, domain, mission notes). After that, type
+any objective or one of the built-in commands.
 
-Athena proposes one command at a time. Press `y` to run, `n` to skip, `q` to quit.
+### Commands
 
-## Configuration
+| Command  | What it does |
+|----------|--------------|
+| `workflow` | Open the workflow menu (23 pre-built engagement templates) |
+| `target`   | Set or update the engagement target |
+| `findings` | Show every extracted finding (verified + unverified) |
+| `tree`     | Render the Pentesting Task Tree |
+| `graph`    | Show the attack graph state + pivot suggestions |
+| `scope`    | Show / toggle engagement scope (RoE) |
+| `mitre`    | Show MITRE ATT&CK techniques used this session |
+| `tools`    | Tool availability + auto-install missing |
+| `model`    | Show provider chain status |
+| `agent`    | List all specialist agents |
+| `dashboard` | Concise session status panel |
+| `save`     | Save conversation to file |
+| `report`   | Generate the engagement report now |
+| `clear`    | Clear AI memory (PTT preserved) |
+| `reset`    | Reset everything (PTT + findings + history + sudo cache) |
+| `help`     | Show the help menu |
+| `exit` / `q` | End session and generate report |
 
-### `GROQ_API_KEY`
+Or just type any objective in plain English — Athena routes to the
+right specialist.
 
-Get a free key at <https://console.groq.com> (no credit card). Set it in your shell:
-
-```bash
-export GROQ_API_KEY=gsk_your_key_here
-```
-
-### Scope (Rules of Engagement)
-
-First run creates `~/.athena/scope.json` with `enabled: false`. To enforce engagement boundaries:
-
-```json
-{
-  "enabled": true,
-  "allowed_cidrs":   ["10.10.10.0/24", "192.168.50.0/24"],
-  "blocked_cidrs":   ["192.168.50.99"],
-  "allowed_domains": ["target.com", "*.target.com"],
-  "blocked_domains": ["admin.target.com"],
-  "time_window": {
-    "start": "2026-05-04T09:00",
-    "end":   "2026-05-04T17:00"
-  }
-}
-```
-
-Out-of-scope commands are refused before subprocess. The `scope` REPL command shows current state and toggles enforcement.
-
-## Commands
-
-| Command | What it does |
-| --- | --- |
-| `workflow` | Pick from 23 engagement templates |
-| `target` | Set or change target |
-| `tree` | Show the Pentesting Task Tree |
-| `findings` | List verified + unverified findings |
-| `graph` | Show attack graph state and pivot hints |
-| `mitre` | ATT&CK techniques exercised this session |
-| `scope` | Toggle / view engagement scope |
-| `dashboard` | Full session status panel |
-| `tools` | Tool availability check + auto-install missing |
-| `model` | Provider chain status |
-| `agent` | List specialist agents |
-| `report` | Generate report now (also runs at exit) |
-| `save` | Dump conversation transcript |
-| `clear` | Clear LLM history (PTT preserved) |
-| `reset` | Wipe everything for a fresh engagement |
-| `help` | Full command listing |
-| `exit` / `q` | End session and write report |
-
-Anything else goes to the agent dispatcher as a free-form objective.
-
-## Reports
-
-Reports are written to `~/.athena/logs/report_<timestamp>.md` and include:
-
-- Executive summary + remediation (LLM-cleaned, verified findings only)
-- MITRE ATT&CK coverage table (techniques exercised, findings grouped by technique)
-- Attack graph summary with pivot hints
-- Pentesting Task Tree final state
-- Raw findings with provenance — every finding shows the exact command that produced it
-- Token savings from smart context
-
-## Requirements
-
-- Kali Linux (or NetHunter, or another Debian-based distro with the standard pentest toolset)
-- Python 3.10+
-- Standard Kali tools: nmap, gobuster / feroxbuster, hydra, sqlmap, hashcat, impacket-* etc. The `tools` command can auto-install missing ones via `apt`.
-- A free Groq API key
-
-## Architecture overview
+### Output format the AI uses
 
 ```
-┌───────────────────────────────────────────────────────────────────┐
-│                            REPL loop                              │
-│   priest input → agent_loop → think_turn → run_command → output   │
-└───────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌────────────────────┐   ┌────────────────────┐   ┌────────────────┐
-│   ContextManager   │   │     PTT (state)    │   │ ScopeConfig    │
-│                    │   │                    │   │                │
-│ minimal by default │   │ hierarchical nodes │   │ CIDR + domain  │
-│ [NEED] re-fetches  │   │ findings, attempts │   │ time windows   │
-│ ~50% token savings │   │ confidence, status │   │ enforced pre-  │
-│                    │   │                    │   │ subprocess     │
-└────────────────────┘   └────────────────────┘   └────────────────┘
-                                │
-                                ▼
-┌────────────────────┐   ┌────────────────────┐   ┌────────────────┐
-│  Specialist agents │   │  ToolBuilder + 28  │   │  AttackGraph   │
-│                    │   │  structured tools  │   │  (networkx)    │
-│ recon · web · AD   │   │                    │   │                │
-│ network · privesc  │   │ [TOOL]name[/TOOL]  │   │ host · service │
-│ credential · exfil │   │ [ARGS]json[/ARGS]  │   │ cred · vuln    │
-│ evasion · reporter │   │ → typed shell str  │   │ pivot graph    │
-└────────────────────┘   └────────────────────┘   └────────────────┘
-                                │
-                                ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  Source-tagged finding extraction · MITRE ATT&CK auto-tagging     │
-│  PoC verification queue · Auto credential fanout · Provider chain │
-└───────────────────────────────────────────────────────────────────┘
+[THOUGHT]<reasoning>[/THOUGHT]
+[TOOL]<tool_name>[/TOOL][ARGS]<json>[/ARGS]    # or [CMD]<shell>[/CMD]
+[CONF]green|yellow|red[/CONF]
+[VERIFY]<verify_command>[/VERIFY]              # optional
+[HANDOFF]<other_agent>[/HANDOFF]               # optional
+[NEED]ptt|history|findings|graph|kb N[/NEED]   # optional, re-fetch
 ```
 
-## Authorized testing only
+---
 
-This is an offensive tool. Run it only against systems you own or have explicit written authorization to test. Unauthorized access to computer systems is illegal in most jurisdictions. The author accepts no responsibility for misuse.
+## Files
+
+```
+athena.py                    # the whole agent, single file
+~/.athena/scope.json         # engagement scope / RoE
+~/.athena/logs/session_*.txt # per-session command + output log
+~/.athena/logs/report_*.md   # markdown report at end of session
+/tmp/athena_session.lock     # boot-check TTL marker (6h)
+```
+
+---
+
+## Safety
+
+Athena will **refuse**:
+
+- `apt upgrade` / `apt full-upgrade` / `apt dist-upgrade` and any
+  variants (Phosh + UI packages stay stable on a NetHunter phone).
+- Destructive commands (`rm -rf /`, `dd if=`, `mkfs`, fork bombs,
+  `shutdown`, `chmod -R 777 /`, `chown -R … /`).
+- Interactive shells that would hijack the terminal (msfconsole
+  without `-q -r`, ssh interactive, vi/nano/less/top, mysql/psql
+  REPL). Each gets a non-interactive replacement hint.
+- Out-of-scope targets when scope enforcement is enabled.
+
+Every other command goes through the `y/n/q` gate before execution.
+System-modifying commands get a second confirmation. Sudo is opt-in,
+prompted once per session via `getpass`, cached only in RAM, and fed
+to commands via `sudo -S` from stdin.
+
+---
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+This is a personal project by The Priest. Use at your own risk on
+systems you own or have explicit written authorisation to test.
