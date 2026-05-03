@@ -1,0 +1,20 @@
+{
+  "enabled": false,
+  "allowed_cidrs": [
+    "10.10.10.0/24",
+    "192.168.50.0/24"
+  ],
+  "blocked_cidrs": [],
+  "allowed_domains": [
+    "target.com",
+    "*.target.com"
+  ],
+  "blocked_domains": [
+    "admin.target.com"
+  ],
+  "time_window": {
+    "start": "",
+    "end": ""
+  },
+  "note": "Set 'enabled' to true to enforce. Out-of-scope commands will be refused before execution. Wildcards (*.example.com) supported in domains. time_window uses ISO-8601 in local TZ; leave empty for no time bound. This file lives at ~/.athena/scope.json — the in-app 'scope' command toggles enabled and shows current state."
+}
