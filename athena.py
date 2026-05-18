@@ -99,15 +99,16 @@ except ImportError:
 
 VERSION = "7.2"
 
-# Strict size descending. Compound models last because they have their
-# own internal multi-step behaviour that fights our PTT control flow.
+# v7.4 — CHEAP-FIRST chain.  Lead with smaller/faster models to save the
+# free-tier budget.  Fall up to bigger models only when small ones fail
+# (rate-limit, 404, or parsing error).  This cut API spend ~6x in testing.
 PROVIDER_CHAIN = [
-    ("openai/gpt-oss-120b",                            "GPT-OSS 120B"),
-    ("llama-3.3-70b-versatile",                        "LLaMA 3.3 70B"),
-    ("qwen/qwen3-32b",                                 "Qwen3 32B"),
-    ("openai/gpt-oss-20b",                             "GPT-OSS 20B"),
-    ("meta-llama/llama-4-scout-17b-16e-instruct",      "LLaMA 4 Scout 17B"),
     ("llama-3.1-8b-instant",                           "LLaMA 3.1 8B"),
+    ("meta-llama/llama-4-scout-17b-16e-instruct",      "LLaMA 4 Scout 17B"),
+    ("openai/gpt-oss-20b",                             "GPT-OSS 20B"),
+    ("qwen/qwen3-32b",                                 "Qwen3 32B"),
+    ("llama-3.3-70b-versatile",                        "LLaMA 3.3 70B"),
+    ("openai/gpt-oss-120b",                            "GPT-OSS 120B"),
     ("allam-2-7b",                                     "Allam 2 7B"),
     ("groq/compound",                                  "Groq Compound"),
     ("groq/compound-mini",                             "Compound Mini"),
@@ -123,12 +124,12 @@ LOG_DIR     = os.path.join(INSTALL_DIR, "logs")
 SCOPE_FILE  = os.path.join(INSTALL_DIR, "scope.json")
 BOOT_LOCK   = "/tmp/athena_session.lock"
 
-# v7.1 — smart context: keep more in memory, send less by default
+# v7.4 — smart context: keep more in memory, send less by default
 MAX_HISTORY_MESSAGES   = 32   # how many turns kept in RAM
-DEFAULT_HISTORY_SLICE  = 4    # how many sent to API by default
-EXPANDED_HISTORY_SLICE = 10   # when stuck/yellow/red conf
-MAX_OUTPUT_CHARS       = 5000
-MAX_TOKENS_DEFAULT     = 2048
+DEFAULT_HISTORY_SLICE  = 3    # how many sent to API by default (was 4)
+EXPANDED_HISTORY_SLICE = 8    # when stuck/yellow/red conf (was 10)
+MAX_OUTPUT_CHARS       = 4000 # cap subprocess output sent back to model
+MAX_TOKENS_DEFAULT     = 1024 # was 2048 — most turns finish well under this
 WORKFLOW_DONE          = "WORKFLOW_COMPLETE"
 
 # How many [NEED] re-fetches allowed per turn (prevents runaway loops)
@@ -3846,6 +3847,53 @@ WORKFLOWS = {
 # CORE RULES embedded in every system prompt
 # ═════════════════════════════════════════════════════════════════════
 
+# v7.4 — Mentor / roast-teacher voice.  Injected into EVERY system prompt
+# so the [THOUGHT] block carries explanations and roasts.  The GUI parses
+# [THOUGHT] panels directly so we never spend extra API calls on UI fluff.
+MENTOR_PERSONA = (
+    "── ATHENA — VOICE & TEACHING DUTY ──\n"
+    "You are Athena: ex-NSA, fifteen years red-team, now babysitting a\n"
+    "junior operator codenamed The Priest. You've seen every CTF, every box,\n"
+    "every dumb script kiddie mistake. You speak like a senior to a junior:\n"
+    "direct, blunt, zero hedging. No 'I am an AI' disclaimers. No apologies.\n"
+    "Dry humour and sharp edges are welcome. Profanity if it fits.\n"
+    "\n"
+    "VOICE:\n"
+    " - Pentester slang is natural: pwn, foothold, low-hang, banner-grab,\n"
+    "   spray, kerberoast, dirty SMB, fat-finger, ricochet, foothold flip.\n"
+    " - When the operator picks something stupid — loud scan on a hot net,\n"
+    "   brute force without spraying, wrong tool for the surface — ROAST.\n"
+    "   Not nasty. Like a coach who wants them to win:\n"
+    "     'nmap -T5 -A on a corp net? gg, you're in someone's pcap already.'\n"
+    "     'Hydra default list on SSH port 22? fail2ban exists, buddy.'\n"
+    "     'You ran linpeas before id/sudo -l? Slow down, jesus.'\n"
+    " - When they nail it: short nod. 'good — that's the move.'\n"
+    " - Cite REAL CVEs, REAL tool flags, REAL paths. Never invent.\n"
+    "\n"
+    "TEACHING DUTY — every [THOUGHT] block MUST contain:\n"
+    " 1. WHY this command (one sentence, plain English).\n"
+    " 2. WHAT to watch for in the output (one sentence).\n"
+    " 3. IF the last result showed a screw-up by the operator or by you —\n"
+    "    out-of-scope, missed low-hang, loud when should've been quiet,\n"
+    "    wrong tool for the layer — call it out briefly. Don't gloss.\n"
+    "\n"
+    "MANUAL HAND-OFFS — when the next move needs the HUMAN to do something\n"
+    "you can't (interactive shell, browser UI, physical access, screenshot,\n"
+    "OOB callback listener setup, decoding a binary in Ghidra), emit:\n"
+    "    [MANUAL]\n"
+    "    1. <first concrete step — exact command or click path>\n"
+    "    2. <second step>\n"
+    "    3. <…>\n"
+    "    [/MANUAL]\n"
+    "Keep it to 3-5 numbered steps. The GUI renders this as a manual\n"
+    "playbook card for the operator.\n"
+    "\n"
+    "STUCK-DETECTION — if the operator types 'stuck', 'idk', 'help', or\n"
+    "'wtf', drop the next [CMD] and instead emit a [MANUAL] block with\n"
+    "concrete next moves they should try by hand. Then continue normally."
+)
+
+
 CORE_RULES = (
     "OUTPUT FORMAT (STRICT — emit ONE of either form):\n"
     "  [THOUGHT]<reasoning>[/THOUGHT]\n"
@@ -3884,7 +3932,15 @@ CORE_RULES = (
     " - CONF yellow = uncertain, propose pivot.\n"
     " - CONF red = need more info before any command.\n"
     " - Cite CVSS/CVE numbers in [THOUGHT] where relevant.\n"
-    " - Reason from real subprocess output only — not from prior assumptions."
+    " - Reason from real subprocess output only — not from prior assumptions.\n"
+    " - TEACHING: every [THOUGHT] must say WHY this cmd + WHAT to watch for.\n"
+    "   When operator screws up (loud scan, wrong tool, missed low-hang),\n"
+    "   call it briefly. Coach, don't sugar-coat.\n"
+    " - MANUAL: when the next move needs the human (browser, interactive\n"
+    "   shell, GUI tool, listener setup, OOB callback), drop the [CMD]\n"
+    "   and emit [MANUAL]<numbered steps>[/MANUAL] instead.\n"
+    " - If operator types 'stuck'/'help'/'idk'/'wtf', skip [CMD] and emit\n"
+    "   [MANUAL] with 3-5 concrete next moves."
 )
 
 
@@ -4053,9 +4109,16 @@ def build_system_prompt(agent_role: str,
     if scope and scope.enabled:
         scope_block = "⚠ ENGAGEMENT SCOPE ENFORCED — out-of-scope commands will be refused."
 
+    # v7.4 — Mentor / roast-teacher voice prepended to every system prompt.
+    # Saves the GUI from having to make extra Groq calls for "explain this
+    # command" because Athena will already explain it in [THOUGHT].
+    mentor_block = MENTOR_PERSONA
+
     parts = [
         f"You are Athena, an elite offensive AI assistant on Kali NetHunter.",
         f"Operator: The Priest.  Your LHOST: {lhost}",
+        "",
+        mentor_block,
         "",
         f"=== ACTIVE AGENT: {spec['icon']} {spec['name']} ===",
         spec["persona"],
@@ -4097,6 +4160,7 @@ def parse_specialist_response(text: str) -> Dict[str, Any]:
         "verify":   None,
         "handoff":  None,
         "need":     [],          # v7.1 — list of attachment requests
+        "manual":   None,        # v7.4 — numbered manual playbook
     }
     if not text:
         return out
@@ -4104,6 +4168,11 @@ def parse_specialist_response(text: str) -> Dict[str, Any]:
     t = re.search(r'\[THOUGHT\](.*?)\[/?THOUGHT\]', text, re.DOTALL | re.IGNORECASE)
     if t:
         out["thought"] = t.group(1).strip()
+
+    # v7.4 — [MANUAL] block for human-do-this guidance
+    m = re.search(r'\[MANUAL\](.*?)\[/?MANUAL\]', text, re.DOTALL | re.IGNORECASE)
+    if m:
+        out["manual"] = m.group(1).strip()
 
     c = re.search(r'\[CMD\](.*?)\[/?CMD\]', text, re.DOTALL | re.IGNORECASE)
     if c:
@@ -5170,6 +5239,12 @@ class AthenaSession:
         ))
         if parsed["thought"]:
             print(thought_card(parsed["thought"], agent_role=agent_role))
+        # v7.4 — render [MANUAL] block as its own panel so GUI shows
+        # it as a "playbook" card, terminal shows it as a yellow box.
+        if parsed["manual"]:
+            steps = parsed["manual"].splitlines()
+            steps = [s.rstrip() for s in steps if s.strip()]
+            print(panel("MANUAL PLAYBOOK", steps, color="33"))
         if parsed["tool"] and parsed["cmd"]:
             tool_attack = attack_id_for_command(parsed["cmd"])
             t_id = tool_attack[0] if tool_attack else ""

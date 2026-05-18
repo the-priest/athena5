@@ -2,32 +2,16 @@
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║          ATHENA GUI — Native pentest assistant · v7.4            ║
 # ║                                                                  ║
+# ║   ZERO extra Groq calls — Athena's THOUGHT panels do the         ║
+# ║   teaching now (mentor persona injected into her system prompt). ║
+# ║                                                                  ║
 # ║   · Engagement wizard (target + goal in one form)                ║
-# ║   · Per-command explanations via background Groq calls           ║
-# ║   · "Watching for…" tips while commands run                      ║
-# ║   · Auto manual-help when Athena errors or gets stuck            ║
-# ║   · "I'm stuck" rescue button always visible                     ║
+# ║   · Renders athena's [MANUAL] playbook panels as cards           ║
+# ║   · "I'm stuck" button just types 'stuck' to athena              ║
 # ║   · Persistent config + Groq key (~/.athena/config.json)         ║
 # ║   · No idle/disabled input — always allow typing                 ║
-# ║   · libadwaita 1.6+ compatible dialogs                           ║
+# ║   · libadwaita 1.6+ compatible dialogs with fallbacks            ║
 # ╚══════════════════════════════════════════════════════════════════╝
-"""
-   athena.py (unchanged 6000-line REPL)
-        │  PTY stdout
-        ▼
-   AthenaProcess ──→ LineBuffer ──→ PanelParser ──→ events
-        │                                              │
-        │                                              ▼
-        │                                  ConversationView (cards)
-        │                                              │
-        ▲                                              ▼
-        └─── user input ── InputBar / decision buttons / wizard
-                                                       │
-                                                       ▼
-                                              GroqExplainer (bg thread)
-                                              annotates cards with
-                                              plain-English help.
-"""
 
 from __future__ import annotations
 
@@ -42,8 +26,6 @@ import struct
 import signal
 import subprocess
 import shlex
-import threading
-import time
 from typing import Callable, Optional, List, Dict, Any
 
 import gi
@@ -52,12 +34,6 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
-
-try:
-    from groq import Groq
-    HAS_GROQ = True
-except ImportError:
-    HAS_GROQ = False
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -80,8 +56,6 @@ SCRIPT_CANDIDATES = [
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "athena.py"),
 ]
 
-EXPLAIN_MODEL = "llama-3.1-8b-instant"  # fast model for UI annotations
-
 
 def find_athena_script() -> Optional[str]:
     for c in SCRIPT_CANDIDATES:
@@ -97,9 +71,7 @@ def find_athena_script() -> Optional[str]:
 class Config:
     DEFAULTS: Dict[str, Any] = {
         "groq_api_key": "",
-        "show_explanations": True,
-        "auto_help_on_error": True,
-        "last_target": {"ip": "", "domain": "", "notes": "", "goal": ""},
+        "last_target":  {"ip": "", "domain": "", "notes": "", "goal": ""},
     }
 
     @classmethod
@@ -137,95 +109,6 @@ class Config:
 
 
 # ═════════════════════════════════════════════════════════════════════
-# GROQ EXPLAINER — background thread, never blocks UI
-# ═════════════════════════════════════════════════════════════════════
-
-class GroqExplainer:
-    """Async Groq calls for plain-English help.  All results delivered
-    back to the GTK main loop via GLib.idle_add()."""
-
-    SYS_EXPLAIN = (
-        "You are a concise pentest assistant. Explain shell commands in "
-        "ONE short sentence (max 25 words). No preamble, no markdown. "
-        "Just the plain-English purpose."
-    )
-    SYS_WATCHING = (
-        "You are a pentest assistant. In ONE short sentence (max 20 words) "
-        "tell the user what to look for in the output of this command. "
-        "No preamble, no markdown."
-    )
-    SYS_MANUAL = (
-        "You are a senior pentester guiding a junior through a tricky step. "
-        "Athena (an AI agent) hit a problem it can't auto-resolve. Give "
-        "3-5 short numbered manual steps the human should perform. "
-        "Be concrete: exact commands, tools, file paths. "
-        "No fluff, no caveats, no markdown headers. Just numbered steps."
-    )
-    SYS_TIP = (
-        "You are a pentest assistant. In one short paragraph (max 50 words) "
-        "give the user a tip about what they just learned or should try next. "
-        "No preamble, no markdown."
-    )
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._client: Optional[Any] = None
-
-    def _get_client(self) -> Optional[Any]:
-        if not HAS_GROQ:
-            return None
-        key = os.environ.get("GROQ_API_KEY", "").strip()
-        if not key:
-            return None
-        with self._lock:
-            if self._client is None:
-                try:
-                    self._client = Groq(api_key=key)
-                except Exception:
-                    return None
-            return self._client
-
-    def _ask(self, system: str, user: str, callback: Callable[[str], None]) -> None:
-        def worker():
-            client = self._get_client()
-            if client is None:
-                GLib.idle_add(callback, "")
-                return
-            try:
-                resp = client.chat.completions.create(
-                    model=EXPLAIN_MODEL,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    temperature=0.2,
-                    max_tokens=300,
-                )
-                text = resp.choices[0].message.content.strip()
-            except Exception as e:
-                text = f"(explanation unavailable: {type(e).__name__})"
-            GLib.idle_add(callback, text)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def explain_command(self, cmd: str, callback: Callable[[str], None]) -> None:
-        self._ask(self.SYS_EXPLAIN, f"Command:\n{cmd}", callback)
-
-    def watching_for(self, cmd: str, callback: Callable[[str], None]) -> None:
-        self._ask(self.SYS_WATCHING, f"Command:\n{cmd}", callback)
-
-    def manual_steps(self, context: str, callback: Callable[[str], None]) -> None:
-        self._ask(self.SYS_MANUAL, context, callback)
-
-    def general_tip(self, context: str, callback: Callable[[str], None]) -> None:
-        self._ask(self.SYS_TIP, context, callback)
-
-
-# Single shared instance
-EXPLAINER = GroqExplainer()
-
-
-# ═════════════════════════════════════════════════════════════════════
 # CSS
 # ═════════════════════════════════════════════════════════════════════
 
@@ -243,7 +126,6 @@ headerbar {
 .feed { background: #0a0612; padding: 8px; }
 .feed-inner { padding-bottom: 80px; }
 
-/* base card */
 .card {
     background: #18102a;
     border: 1px solid #2a1a3a;
@@ -252,32 +134,27 @@ headerbar {
     margin: 6px 4px;
 }
 .card-title {
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 1.8px;
-    color: #9d7da0;
+    font-size: 10px; font-weight: 700;
+    letter-spacing: 1.8px; color: #9d7da0;
     margin-bottom: 6px;
 }
 .card-body { color: #e6dcf0; font-size: 14px; }
 
-/* welcome card */
 .welcome {
     background: linear-gradient(180deg, #1a1030 0%, #0a0612 100%);
-    border-color: #4a2a6a;
-    padding: 18px;
+    border-color: #4a2a6a; padding: 18px;
 }
 .welcome-title {
     color: #cc66ff; font-size: 22px; font-weight: 700;
     letter-spacing: 1px; margin-bottom: 4px;
 }
-.welcome-sub  { color: #b8a8c8; font-size: 13px; margin-bottom: 12px; }
-.welcome-btn  {
+.welcome-sub { color: #b8a8c8; font-size: 13px; margin-bottom: 12px; }
+.welcome-btn {
     background: #cc66ff; color: #0a0612;
     border-radius: 12px; padding: 14px; min-height: 52px;
     font-weight: 700; font-size: 14px;
 }
 
-/* thought */
 .thought {
     background: linear-gradient(180deg, #1a1030 0%, #14082a 100%);
     border-color: #4a2a6a;
@@ -285,28 +162,15 @@ headerbar {
 .thought .card-title { color: #cc88ff; }
 .thought .card-body { font-style: italic; color: #d9c9e9; }
 
-/* command */
 .command { background: #0e1a22; border-color: #2a4a5a; }
 .command .card-title { color: #66ccff; }
 .cmd-code {
-    background: #050a0e;
-    border: 1px solid #1a3a4a;
-    border-radius: 8px;
-    padding: 10px 12px;
+    background: #050a0e; border: 1px solid #1a3a4a;
+    border-radius: 8px; padding: 10px 12px;
     color: #b9e9ff;
     font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
     font-size: 13px;
 }
-.explain-block {
-    background: #14202a;
-    border-left: 3px solid #66ccff;
-    border-radius: 6px;
-    padding: 8px 12px;
-    margin-top: 8px;
-    color: #c8d8e8; font-size: 12px;
-}
-.explain-block .key { color: #88ccff; font-weight: 700; letter-spacing: 1px; }
-.explain-loading { color: #6a7a8a; font-style: italic; }
 
 .conf-pill {
     padding: 3px 9px; border-radius: 999px;
@@ -321,7 +185,6 @@ headerbar {
     background: #2a1030; color: #cc88ff; border: 1px solid #4a2a6a;
 }
 
-/* decision buttons */
 .decision-bar {
     margin-top: 12px; border-top: 1px solid #1a3a4a; padding-top: 12px;
 }
@@ -343,7 +206,6 @@ headerbar {
 .decision-done.skipped { background: #3a2a1a; color: #e9d9b9; }
 .decision-done.quit    { background: #3a1a1a; color: #e9b9b9; }
 
-/* result */
 .result { border-color: #2a3a4a; }
 .result .card-title { color: #88c0a0; }
 .result-output {
@@ -353,7 +215,6 @@ headerbar {
     font-size: 12px;
 }
 
-/* findings */
 .findings { background: #0e1a14; border-color: #2a5a3a; }
 .findings .card-title { color: #88dd99; }
 .finding-row {
@@ -361,28 +222,20 @@ headerbar {
     border-bottom: 1px solid #1a2a1a;
 }
 
-/* error */
 .error { background: #1a0a0e; border-color: #5a2a2a; }
 .error .card-title { color: #ff7788; }
 
-/* manual help */
+/* manual playbook (from Athena's [MANUAL] tag) */
 .manual {
     background: #1a1408; border-color: #6a5020;
-    margin-top: 4px;
 }
 .manual .card-title { color: #ffcc66; }
 .manual-step {
     background: #25200a; border-radius: 6px;
-    padding: 8px 10px; margin: 3px 0;
+    padding: 10px 12px; margin: 3px 0;
     color: #f0e0c0; font-size: 13px;
 }
-.copy-pill {
-    background: #2a2018; color: #ffcc88;
-    padding: 4px 10px; border-radius: 999px;
-    font-size: 10px; font-weight: 600;
-}
 
-/* dispatch + executing */
 .dispatch, .executing {
     background: transparent; border: none;
     padding: 4px 12px; margin: 2px 8px;
@@ -391,33 +244,21 @@ headerbar {
     color: #8d7da0; font-size: 11px; letter-spacing: 1px;
     font-family: monospace;
 }
-.exec-tip {
-    background: #0e1a22;
-    border-left: 3px solid #66ccff;
-    border-radius: 6px;
-    padding: 6px 10px;
-    margin: 4px 8px;
-    color: #c8d8e8; font-size: 11px;
-}
 
-/* banner */
 .banner {
     background: #0a0612; border: 1px solid #4a2a6a;
     border-radius: 14px; padding: 10px; margin: 6px 4px;
 }
 .banner-art { font-family: monospace; font-size: 10px; color: #cc66ff; }
 
-/* turn */
 .turn-header {
     color: #6a5a7a; font-size: 10px; font-family: monospace;
     letter-spacing: 2px; padding: 12px 8px 4px 8px;
 }
 
-/* plain */
 .plain { background: transparent; border: none; padding: 4px 12px; }
 .plain .card-body { color: #b8a8c8; font-family: monospace; font-size: 12px; }
 
-/* sidebar */
 .athena-sidebar { background: #0e0a18; }
 .sidebar-header {
     color: #6a5a7a; font-size: 10px; font-weight: 700;
@@ -429,7 +270,6 @@ headerbar {
 }
 .sidebar-button:hover { background: #1f1530; }
 
-/* input bar */
 .input-bar {
     background: #15101f;
     border-top: 1px solid #2a1a3a;
@@ -450,9 +290,7 @@ headerbar {
     color: #6a5a7a; font-size: 10px; letter-spacing: 1.2px;
     padding: 0 6px 4px;
 }
-.rescue-row {
-    margin-top: 6px;
-}
+.rescue-row { margin-top: 6px; }
 .rescue-btn {
     background: #2a1a3a; color: #ffcc88;
     border-radius: 8px; padding: 6px 10px;
@@ -460,12 +298,11 @@ headerbar {
 }
 .rescue-btn:hover { background: #3a2a4a; }
 
-/* wizard */
 .wizard-title {
     color: #cc66ff; font-size: 18px; font-weight: 700;
     margin-bottom: 4px;
 }
-.wizard-sub { color: #b8a8c8; font-size: 12px; margin-bottom: 12px; }
+.wizard-sub   { color: #b8a8c8; font-size: 12px; margin-bottom: 12px; }
 .wizard-label {
     color: #88aacc; font-size: 11px;
     font-weight: 700; letter-spacing: 1.2px;
@@ -480,15 +317,12 @@ headerbar {
 """
 
 
-# ═════════════════════════════════════════════════════════════════════
-# CSS LOADER — handles both legacy and modern GTK4 APIs
-# ═════════════════════════════════════════════════════════════════════
-
 def load_css() -> None:
+    """Compatible across GTK4 4.10+ (load_from_string) and older (load_from_data)."""
     css = Gtk.CssProvider()
     if hasattr(css, "load_from_string"):
         css.load_from_string(CSS)
-    elif hasattr(css, "load_from_data"):
+    else:
         try:
             css.load_from_data(CSS, -1)
         except TypeError:
@@ -710,7 +544,10 @@ class AthenaProcess(GObject.Object):
             pass
 
     def writeln(self, text: str = "") -> None:
-        self.write(text + "\n")
+        # Newlines INSIDE the text would split the input into multiple
+        # responses to athena's prompts — collapse them to spaces.
+        clean = text.replace("\n", " ").replace("\r", " ")
+        self.write(clean + "\n")
 
     def _on_readable(self, fd, condition):
         if condition & GLib.IOCondition.HUP and not (condition & GLib.IOCondition.IN):
@@ -765,13 +602,13 @@ class WelcomeCard(Gtk.Box):
     def __init__(self, on_start: Callable[[], None]):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         card = _card("", "welcome")
-        t = Gtk.Label(label="Welcome to Athena", xalign=0)
+        t = Gtk.Label(label="Welcome back, Priest", xalign=0)
         t.add_css_class("welcome-title")
         card.append(t)
         s = Gtk.Label(
-            label="Your AI offensive-security partner.  Tell her a target "
-                  "and what you want to do — she'll plan it, run it, and "
-                  "explain every move.",
+            label="Tell me a target and what you want to do with it.  I'll "
+                  "plan it, run it, explain every move, and roast you when "
+                  "you screw up.",
             xalign=0)
         s.set_wrap(True)
         s.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
@@ -793,11 +630,9 @@ class ThoughtCard(Gtk.Box):
 
 
 class CommandCard(Gtk.Box):
-    """Command card with explanation, decision buttons, copy support."""
+    """Command card with confidence pill, ATT&CK tag, and tap buttons."""
 
-    def __init__(self, body: str, *,
-                 on_decision: Callable[[str], None],
-                 want_explanation: bool):
+    def __init__(self, body: str, *, on_decision: Callable[[str], None]):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self._on_decision = on_decision
         self._answered = False
@@ -829,15 +664,6 @@ class CommandCard(Gtk.Box):
         code.set_selectable(True)
         card.append(code)
 
-        # Explanation block — populated async by Groq
-        if want_explanation:
-            self._explain = self._make_explain_block()
-            card.append(self._explain)
-            EXPLAINER.explain_command(cmd_text, self._set_explanation)
-        else:
-            self._explain = None
-
-        # Decision bar (revealed when y/n/q prompt fires)
         self._decision_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self._decision_bar.add_css_class("decision-bar")
         self._decision_bar.set_homogeneous(True)
@@ -863,29 +689,6 @@ class CommandCard(Gtk.Box):
     @property
     def command(self) -> str:
         return self._cmd_text
-
-    def _make_explain_block(self) -> Gtk.Box:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        box.add_css_class("explain-block")
-        head = Gtk.Label(label="💡 WHAT THIS DOES", xalign=0)
-        head.add_css_class("key")
-        box.append(head)
-        self._explain_label = Gtk.Label(label="(asking Athena to explain…)", xalign=0)
-        self._explain_label.set_wrap(True)
-        self._explain_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self._explain_label.set_selectable(True)
-        self._explain_label.add_css_class("explain-loading")
-        box.append(self._explain_label)
-        return box
-
-    def _set_explanation(self, text: str) -> bool:
-        if self._explain is None:
-            return False
-        if not text:
-            text = "(no explanation available — check API key)"
-        self._explain_label.set_text(text)
-        self._explain_label.remove_css_class("explain-loading")
-        return False
 
     def _extract_meta(self, body: str):
         conf = None
@@ -972,57 +775,26 @@ class ErrorCard(Gtk.Box):
         card = _card(f"⛔ {title}", "error")
         card.append(_body_label(body))
         self.append(card)
-        self._body = body
-        self._title = title
-
-    @property
-    def context(self) -> str:
-        return f"Athena reported an error in [{self._title}]:\n{self._body}"
 
 
-class ManualHelpCard(Gtk.Box):
-    """Pentest-assistant guidance: Groq generates 3-5 numbered manual steps."""
+class ManualPlaybookCard(Gtk.Box):
+    """Renders Athena's [MANUAL] panel body as numbered cards.  Zero Groq
+    cost — the steps already came from her response."""
 
-    def __init__(self, context: str):
+    def __init__(self, body: str):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        card = _card("🛠 Manual playbook", "manual")
-        self._step_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-
-        loading = Gtk.Label(label="Generating manual steps…", xalign=0)
-        loading.add_css_class("manual-step")
-        loading.add_css_class("explain-loading")
-        self._loading_label = loading
-        self._step_box.append(loading)
-
-        card.append(self._step_box)
-        self.append(card)
-        EXPLAINER.manual_steps(context, self._populate)
-
-    def _populate(self, text: str) -> bool:
-        # remove the loading placeholder
-        try:
-            self._step_box.remove(self._loading_label)
-        except Exception:
-            pass
-
-        if not text:
-            row = Gtk.Label(label="(could not generate — check Groq API key)", xalign=0)
-            row.add_css_class("manual-step")
-            self._step_box.append(row)
-            return False
-
-        steps = self._split_steps(text)
+        card = _card("🛠 Manual playbook — your turn", "manual")
+        steps = self._split_steps(body)
         for step in steps:
             row = Gtk.Label(label=step, xalign=0)
             row.add_css_class("manual-step")
             row.set_wrap(True)
             row.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
             row.set_selectable(True)
-            self._step_box.append(row)
-        return False
+            card.append(row)
+        self.append(card)
 
     def _split_steps(self, text: str) -> List[str]:
-        # Split on numbered list markers like "1.", "1)", or newlines
         parts = re.split(r"\n(?=\s*\d+[.\)]\s)", text.strip())
         if len(parts) <= 1:
             parts = [p.strip() for p in text.split("\n") if p.strip()]
@@ -1046,7 +818,7 @@ class DispatchCard(Gtk.Box):
 
 
 class ExecutingCard(Gtk.Box):
-    def __init__(self, body: str = "", last_command: str = ""):
+    def __init__(self, body: str = ""):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         card = _card("", "executing")
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -1055,18 +827,6 @@ class ExecutingCard(Gtk.Box):
         row.append(_body_label("EXECUTING " + body))
         card.append(row)
         self.append(card)
-        if last_command:
-            self._tip = Gtk.Label(label="🔎 watching for…", xalign=0)
-            self._tip.add_css_class("exec-tip")
-            self._tip.set_wrap(True)
-            self._tip.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-            self.append(self._tip)
-            EXPLAINER.watching_for(last_command, self._set_tip)
-
-    def _set_tip(self, text: str) -> bool:
-        if text:
-            self._tip.set_text("🔎 " + text)
-        return False
 
 
 class TurnHeader(Gtk.Box):
@@ -1095,6 +855,7 @@ class BannerCard(Gtk.Box):
 
 def classify_panel_title(title: str) -> str:
     t = title.upper()
+    if "MANUAL" in t and ("PLAYBOOK" in t or "MANUAL" == t.strip()): return "manual"
     if "THOUGHT" in t:   return "thought"
     if "DISPATCH" in t:  return "dispatch"
     if "EXECUTING" in t: return "executing"
@@ -1107,11 +868,7 @@ def classify_panel_title(title: str) -> str:
 
 
 class ConversationView(Gtk.ScrolledWindow):
-    """Append-only feed of cards.  Tracks latest command for executing tips
-    and latest error for auto-help generation."""
-
-    def __init__(self, on_decision: Callable[[str], None],
-                 want_explanations: bool, want_auto_help: bool):
+    def __init__(self, on_decision: Callable[[str], None]):
         super().__init__()
         self.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.set_kinetic_scrolling(True)
@@ -1119,15 +876,12 @@ class ConversationView(Gtk.ScrolledWindow):
         self.add_css_class("feed")
 
         self._on_decision = on_decision
-        self._want_explanations = want_explanations
-        self._want_auto_help = want_auto_help
 
         self._inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self._inner.add_css_class("feed-inner")
         self.set_child(self._inner)
 
         self._latest_command: Optional[CommandCard] = None
-        self._latest_command_text: str = ""
         self._max_cards = 400
         self._stick_bottom = True
         adj = self.get_vadjustment()
@@ -1140,10 +894,6 @@ class ConversationView(Gtk.ScrolledWindow):
     @property
     def inner(self) -> Gtk.Box:
         return self._inner
-
-    @property
-    def latest_command_text(self) -> str:
-        return self._latest_command_text
 
     def append(self, widget: Gtk.Widget) -> None:
         self._inner.append(widget)
@@ -1163,7 +913,6 @@ class ConversationView(Gtk.ScrolledWindow):
             self._inner.remove(c)
             c = nxt
         self._latest_command = None
-        self._latest_command_text = ""
 
     def handle_event(self, ev: dict) -> Optional[str]:
         t = ev.get("type")
@@ -1204,25 +953,21 @@ class ConversationView(Gtk.ScrolledWindow):
         if kind == "thought":
             self.append(ThoughtCard(body))
         elif kind == "command":
-            card = CommandCard(body,
-                               on_decision=self._on_decision,
-                               want_explanation=self._want_explanations)
+            card = CommandCard(body, on_decision=self._on_decision)
             self._latest_command = card
-            self._latest_command_text = card.command
             self.append(card)
         elif kind == "result":
             self.append(ResultCard(body))
         elif kind == "findings":
             self.append(FindingsCard(title, body))
         elif kind == "error":
-            err = ErrorCard(title, body)
-            self.append(err)
-            if self._want_auto_help:
-                self.append(ManualHelpCard(err.context))
+            self.append(ErrorCard(title, body))
+        elif kind == "manual":
+            self.append(ManualPlaybookCard(body))
         elif kind == "dispatch":
             self.append(DispatchCard(body))
         elif kind == "executing":
-            self.append(ExecutingCard(body, last_command=self._latest_command_text))
+            self.append(ExecutingCard(body))
         elif kind == "turn":
             self.append(TurnHeader(title + " " + body))
         else:
@@ -1233,19 +978,9 @@ class ConversationView(Gtk.ScrolledWindow):
             self.append(wrap)
         return None
 
-    def request_manual_help(self) -> None:
-        """User clicked 'I'm stuck' — generate manual steps for current state."""
-        ctx = (
-            "The user is currently working with Athena and feels stuck. "
-            f"Last proposed command was: {self._latest_command_text or '(none yet)'}. "
-            "Give them next-step guidance — what to try manually, what to look at, "
-            "any debugging tips. Be specific."
-        )
-        self.append(ManualHelpCard(ctx))
-
 
 # ═════════════════════════════════════════════════════════════════════
-# INPUT BAR — always allows free text + dedicated rescue button
+# INPUT BAR — always enabled, dedicated rescue button
 # ═════════════════════════════════════════════════════════════════════
 
 class InputBar(Gtk.Box):
@@ -1275,11 +1010,10 @@ class InputBar(Gtk.Box):
         row.append(self._send_btn)
         self.append(row)
 
-        # Rescue row — always visible, one tap to summon manual help
         rescue_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         rescue_row.add_css_class("rescue-row")
         rescue_row.set_halign(Gtk.Align.START)
-        rescue_btn = Gtk.Button(label="🛟 I'm stuck — show manual steps")
+        rescue_btn = Gtk.Button(label="🛟 I'm stuck — ask Athena for manual steps")
         rescue_btn.add_css_class("rescue-btn")
         rescue_btn.connect("clicked", lambda _b: self._on_rescue())
         rescue_row.append(rescue_btn)
@@ -1288,7 +1022,7 @@ class InputBar(Gtk.Box):
         self.set_mode("text")
 
     def set_mode(self, mode: str) -> None:
-        """Modes adjust HINTS only — input itself is always live."""
+        """Hints only — input itself is ALWAYS enabled."""
         if mode == "password":
             self._hint.set_label("PASSWORD REQUIRED")
             self._entry.set_visibility(False)
@@ -1298,12 +1032,10 @@ class InputBar(Gtk.Box):
             self._hint.set_label("TAP A BUTTON ABOVE — RUN · SKIP · QUIT")
             self._entry.set_visibility(True)
             self._entry.set_placeholder_text("or type free text…")
-        else:  # text or idle, treat same
+        else:
             self._hint.set_label("Tell Athena what you want…")
             self._entry.set_visibility(True)
             self._entry.set_placeholder_text("type here, or use buttons above…")
-
-        # Input is ALWAYS sensitive
         self._entry.set_sensitive(True)
         self._send_btn.set_sensitive(True)
 
@@ -1315,30 +1047,12 @@ class InputBar(Gtk.Box):
 
 
 # ═════════════════════════════════════════════════════════════════════
-# ENGAGEMENT WIZARD
+# ENGAGEMENT WIZARD — defensive dialog construction
 # ═════════════════════════════════════════════════════════════════════
 
-def alert_dialog(parent, title: str, body: str = "") -> Any:
-    """Returns either Adw.AlertDialog (libadwaita 1.5+) or Adw.MessageDialog."""
-    if hasattr(Adw, "AlertDialog"):
-        d = Adw.AlertDialog.new(title, body)
-        return d
-    return Adw.MessageDialog.new(parent, title, body)
-
-
-def present_dialog(dlg: Any, parent: Any) -> None:
-    if hasattr(dlg, "present") and isinstance(dlg, Adw.AlertDialog) if hasattr(Adw, "AlertDialog") else False:
-        dlg.present(parent)
-    else:
-        try:
-            dlg.present(parent)
-        except TypeError:
-            dlg.present()
-
-
 class EngagementWizard:
-    """A single-form dialog: target IP/domain + mission goal.
-    Returns the four values athena.py wants: ip, domain, notes, goal."""
+    """Single-form: target IP, domain, notes, goal.  Sends them as
+    sequential inputs to athena.py's startup prompts."""
 
     def __init__(self, parent: Gtk.Window,
                  on_done: Callable[[Dict[str, str]], None],
@@ -1348,36 +1062,33 @@ class EngagementWizard:
         self._on_cancel = on_cancel
         self._last = Config.get("last_target") or {}
 
-        self._ip = Gtk.Entry();     self._ip.add_css_class("wizard-entry")
-        self._dom = Gtk.Entry();    self._dom.add_css_class("wizard-entry")
-        self._notes = Gtk.Entry();  self._notes.add_css_class("wizard-entry")
-        self._goal = Gtk.TextView();
-        self._goal.add_css_class("wizard-entry")
-        self._goal.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self._goal.set_top_margin(6); self._goal.set_bottom_margin(6)
-        self._goal.set_left_margin(8); self._goal.set_right_margin(8)
+        self._ip = Gtk.Entry();    self._ip.add_css_class("wizard-entry")
+        self._dom = Gtk.Entry();   self._dom.add_css_class("wizard-entry")
+        self._notes = Gtk.Entry(); self._notes.add_css_class("wizard-entry")
+        self._goal = Gtk.Entry();  self._goal.add_css_class("wizard-entry")
 
         self._ip.set_text(self._last.get("ip", ""))
         self._dom.set_text(self._last.get("domain", ""))
         self._notes.set_text(self._last.get("notes", ""))
-        self._goal.get_buffer().set_text(
+        self._goal.set_text(
             self._last.get("goal") or
-            "Enumerate the target — find services, vulnerabilities, and "
-            "viable paths to initial access. Be thorough but stay in scope."
+            "Enumerate services, find low-hanging vulns, get a foothold."
         )
 
         self._ip.set_placeholder_text("10.10.10.5  or  192.168.1.0/24")
         self._dom.set_placeholder_text("example.com  or  https://app.target.tld")
-        self._notes.set_placeholder_text("HTB box · client X · CTF · …")
+        self._notes.set_placeholder_text("HTB box · CTF · client X · …")
+        self._goal.set_placeholder_text(
+            "what do you want Athena to do with this target?")
 
         self._build_and_present()
 
     def _build_and_present(self) -> None:
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        body.set_size_request(380, -1)
+        body.set_size_request(360, -1)
 
         sub = Gtk.Label(
-            label="Set the target and your objective. Athena will plan from there.",
+            label="Set the target and your objective.  Athena plans from there.",
             xalign=0)
         sub.set_wrap(True); sub.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         sub.add_css_class("wizard-sub")
@@ -1389,19 +1100,12 @@ class EngagementWizard:
             body.append(l)
             body.append(widget)
 
-        add_field("TARGET IP / CIDR", self._ip)
-        add_field("DOMAIN / URL  (optional)", self._dom)
-        add_field("NOTES  (HTB box, CTF, client tag…)", self._notes)
+        add_field("TARGET IP / CIDR",                 self._ip)
+        add_field("DOMAIN / URL  (optional)",         self._dom)
+        add_field("NOTES  (HTB, CTF, client tag…)",   self._notes)
+        add_field("WHAT DO YOU WANT FROM THIS TARGET?", self._goal)
 
-        l = Gtk.Label(label="WHAT DO YOU WANT FROM THIS TARGET?", xalign=0)
-        l.add_css_class("wizard-label")
-        body.append(l)
-        goal_scroll = Gtk.ScrolledWindow()
-        goal_scroll.set_min_content_height(100)
-        goal_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        goal_scroll.set_child(self._goal)
-        body.append(goal_scroll)
-
+        # Use Adw.AlertDialog if available (1.5+), else MessageDialog
         if hasattr(Adw, "AlertDialog"):
             dlg = Adw.AlertDialog.new("New Engagement", "")
             dlg.set_extra_child(body)
@@ -1427,13 +1131,13 @@ class EngagementWizard:
         if response != "start":
             self._on_cancel()
             return
-        buf = self._goal.get_buffer()
-        goal_text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True).strip()
+        # Strip newlines from goal so it doesn't break athena's input pipe
+        goal = self._goal.get_text().strip().replace("\n", " ").replace("\r", " ")
         values = {
             "ip":     self._ip.get_text().strip(),
             "domain": self._dom.get_text().strip(),
             "notes":  self._notes.get_text().strip(),
-            "goal":   goal_text,
+            "goal":   goal,
         }
         Config.set("last_target", values)
         self._on_done(values)
@@ -1450,16 +1154,12 @@ class AthenaWindow(Adw.ApplicationWindow):
         self.set_default_size(420, 820)
 
         cfg = Config.load()
-        self._show_explanations = bool(cfg.get("show_explanations", True))
-        self._auto_help_on_error = bool(cfg.get("auto_help_on_error", True))
-
-        # If config has a key but env doesn't, set it now
         key = cfg.get("groq_api_key", "")
         if key and not os.environ.get("GROQ_API_KEY"):
             os.environ["GROQ_API_KEY"] = key
 
         self._process: Optional[AthenaProcess] = None
-        self._pending_inputs: List[str] = []  # auto-fed to athena's startup prompts
+        self._pending_inputs: List[str] = []
         self._wizard_open = False
         self._target_pill: Optional[Gtk.Label] = None
         self._agent_pill: Optional[Gtk.Label] = None
@@ -1475,15 +1175,9 @@ class AthenaWindow(Adw.ApplicationWindow):
         toolbar = Adw.ToolbarView()
         toolbar.add_top_bar(self._build_header())
 
-        self._conversation = ConversationView(
-            on_decision=self._on_decision,
-            want_explanations=self._show_explanations,
-            want_auto_help=self._auto_help_on_error,
-        )
-        self._input = InputBar(
-            on_send_text=self._on_send_text,
-            on_rescue=self._on_rescue,
-        )
+        self._conversation = ConversationView(on_decision=self._on_decision)
+        self._input = InputBar(on_send_text=self._on_send_text,
+                               on_rescue=self._on_rescue)
 
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         body.append(self._conversation)
@@ -1493,17 +1187,13 @@ class AthenaWindow(Adw.ApplicationWindow):
 
         self._install_actions()
 
-        # Show welcome card and either prompt for API key or open wizard
         self._conversation.append(WelcomeCard(on_start=self._open_wizard))
         GLib.idle_add(self._initial_check)
-
-    # ── startup choreography ──────────────────────────────────
 
     def _initial_check(self) -> bool:
         if not os.environ.get("GROQ_API_KEY"):
             self._show_api_key_dialog(then_open_wizard=True)
             return False
-        # Have key — open wizard automatically
         self._open_wizard()
         return False
 
@@ -1519,8 +1209,8 @@ class AthenaWindow(Adw.ApplicationWindow):
 
     def _on_wizard_done(self, values: Dict[str, str]) -> None:
         self._wizard_open = False
-        # Queue the four inputs athena.py will ask for at startup:
-        #   IP, Domain, Notes, then a goal at priest prompt.
+        # athena.py asks for: IP, Domain, Notes (set_target), then the
+        # priest prompt accepts free text.  Queue all four in order.
         self._pending_inputs = [
             values.get("ip", ""),
             values.get("domain", ""),
@@ -1528,16 +1218,12 @@ class AthenaWindow(Adw.ApplicationWindow):
             values.get("goal", ""),
         ]
         self._conversation.clear()
-        self._conversation.append(PlainCard(
-            f"── New Engagement ──  target: {values.get('ip') or values.get('domain') or '?'}"
-        ))
+        tag = values.get("ip") or values.get("domain") or "?"
+        self._conversation.append(PlainCard(f"── New Engagement ──  target: {tag}"))
         self._start_athena()
 
     def _on_wizard_cancel(self) -> None:
         self._wizard_open = False
-        # User can hit Start New Engagement again from welcome card
-
-    # ── athena lifecycle ───────────────────────────────────────
 
     def _start_athena(self) -> bool:
         if self._process is not None:
@@ -1573,7 +1259,7 @@ class AthenaWindow(Adw.ApplicationWindow):
             self._update_status_pills(ev["text"])
             return
 
-        # Auto-feed startup prompts (ip/domain/notes/goal) from the wizard
+        # Auto-feed startup prompts from the wizard
         if ev.get("type") == "prompt_text" and self._pending_inputs:
             text = self._pending_inputs.pop(0)
             self._process.writeln(text)
@@ -1595,7 +1281,6 @@ class AthenaWindow(Adw.ApplicationWindow):
 
     def _on_send_text(self, text: str) -> None:
         if self._process is None:
-            # No active process — start one and queue the text as a goal
             self._pending_inputs.append(text)
             self._start_athena()
             return
@@ -1607,7 +1292,13 @@ class AthenaWindow(Adw.ApplicationWindow):
         self._process.writeln(value)
 
     def _on_rescue(self) -> None:
-        self._conversation.request_manual_help()
+        """Stuck button: just tell Athena. Her mentor persona handles it
+        by emitting a [MANUAL] block instead of a [CMD]."""
+        if self._process is None:
+            return
+        self._process.writeln(
+            "stuck — give me manual next steps i should try by hand"
+        )
 
     # ── header ─────────────────────────────────────────────────
 
@@ -1646,7 +1337,6 @@ class AthenaWindow(Adw.ApplicationWindow):
         menu.append("Restart session", "win.restart")
         menu.append("Open logs folder", "win.open-logs")
         menu.append("API key…", "win.api-key")
-        menu.append("Settings…", "win.settings")
         menu.append("About", "win.about")
         more.set_menu_model(menu)
         header.pack_end(more)
@@ -1727,7 +1417,6 @@ class AthenaWindow(Adw.ApplicationWindow):
             ("new-engagement", self._action_new_engagement),
             ("open-logs",      self._action_open_logs),
             ("api-key",        self._action_api_key),
-            ("settings",       self._action_settings),
             ("about",          self._action_about),
         ]:
             act = Gio.SimpleAction.new(name, None)
@@ -1747,16 +1436,14 @@ class AthenaWindow(Adw.ApplicationWindow):
     def _action_open_logs(self, *_):
         os.makedirs(LOG_DIR, exist_ok=True)
         try:
-            Gtk.UriLauncher.new(GLib.filename_to_uri(LOG_DIR)).launch(self, None, None)
+            launcher = Gtk.UriLauncher.new(GLib.filename_to_uri(LOG_DIR))
+            launcher.launch(self, None, None)
         except Exception:
             subprocess.Popen(["xdg-open", LOG_DIR],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _action_api_key(self, *_):
         self._show_api_key_dialog(then_open_wizard=False)
-
-    def _action_settings(self, *_):
-        self._show_settings_dialog()
 
     def _action_about(self, *_):
         if hasattr(Adw, "AboutDialog"):
@@ -1793,10 +1480,10 @@ class AthenaWindow(Adw.ApplicationWindow):
                        Config.get("groq_api_key") or "")
 
         wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        wrap.set_size_request(360, -1)
+        wrap.set_size_request(340, -1)
         info = Gtk.Label(
-            label="Get a free key (no card) at console.groq.com. "
-                  "Saved to ~/.athena/config.json — only on this device.",
+            label="Get a free key at console.groq.com.  Saved to "
+                  "~/.athena/config.json (chmod 600).",
             xalign=0)
         info.set_wrap(True); info.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         info.add_css_class("wizard-sub")
@@ -1809,7 +1496,6 @@ class AthenaWindow(Adw.ApplicationWindow):
                 if k:
                     os.environ["GROQ_API_KEY"] = k
                     Config.set("groq_api_key", k)
-                    # Also push to bashrc/zshrc for CLI usage
                     self._persist_to_shell_rcs(k)
                 if then_open_wizard:
                     GLib.idle_add(self._open_wizard)
@@ -1847,57 +1533,6 @@ class AthenaWindow(Adw.ApplicationWindow):
                     f.write("\n".join(lines) + "\n")
             except OSError:
                 pass
-
-    # ── settings dialog ────────────────────────────────────────
-
-    def _show_settings_dialog(self):
-        wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        wrap.set_size_request(340, -1)
-
-        sw_explain = Gtk.Switch()
-        sw_explain.set_active(self._show_explanations)
-        row1 = self._setting_row("Explain each command (uses Groq)", sw_explain)
-        wrap.append(row1)
-
-        sw_help = Gtk.Switch()
-        sw_help.set_active(self._auto_help_on_error)
-        row2 = self._setting_row("Auto manual help on errors", sw_help)
-        wrap.append(row2)
-
-        def on_resp(_d, r):
-            if r == "save":
-                self._show_explanations = sw_explain.get_active()
-                self._auto_help_on_error = sw_help.get_active()
-                Config.set("show_explanations", self._show_explanations)
-                Config.set("auto_help_on_error", self._auto_help_on_error)
-                # Apply to conversation view immediately
-                self._conversation._want_explanations = self._show_explanations
-                self._conversation._want_auto_help = self._auto_help_on_error
-
-        if hasattr(Adw, "AlertDialog"):
-            dlg = Adw.AlertDialog.new("Settings", "")
-            dlg.set_extra_child(wrap)
-            dlg.add_response("close", "Close")
-            dlg.add_response("save",  "Save")
-            dlg.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
-            dlg.connect("response", on_resp)
-            dlg.present(self)
-        else:
-            dlg = Adw.MessageDialog.new(self, "Settings", "")
-            dlg.set_extra_child(wrap)
-            dlg.add_response("close", "Close")
-            dlg.add_response("save",  "Save")
-            dlg.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
-            dlg.connect("response", on_resp)
-            dlg.present()
-
-    def _setting_row(self, label: str, control: Gtk.Widget) -> Gtk.Box:
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        l = Gtk.Label(label=label, xalign=0); l.set_hexpand(True)
-        l.set_wrap(True); l.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        row.append(l)
-        row.append(control)
-        return row
 
     def do_close_request(self):
         if self._process:
