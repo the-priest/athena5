@@ -48,7 +48,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 # ═════════════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -381,10 +381,10 @@ class PanelParser:
 # ATHENA SUBPROCESS
 # ═════════════════════════════════════════════════════════════════════
 
-class AthenaProcess(GLib.Object):
+class AthenaProcess(GObject.Object):
     __gsignals__ = {
-        "event":  (GLib.SignalFlags.RUN_FIRST, None, (object,)),
-        "exited": (GLib.SignalFlags.RUN_FIRST, None, ()),
+        "event":  (GObject.SignalFlags.RUN_FIRST, None, (object,)),
+        "exited": (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
     def __init__(self, script_path: str):
