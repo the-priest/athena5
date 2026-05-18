@@ -159,10 +159,25 @@ pkg_install_many() {
     case "$PKG" in
         apt)
             sudo_run apt-get update -qq || true
-            sudo_run apt-get install -y --no-install-recommends "${pkgs[@]}"
+            # Install one at a time so a single missing package (e.g.
+            # fonts-jetbrains-mono not in Kali aarch64) doesn't fail the
+            # whole batch.
+            for p in "${pkgs[@]}"; do
+                if ! sudo_run apt-get install -y --no-install-recommends "$p" 2>/dev/null; then
+                    warn "skipped (not in repo): $p"
+                fi
+            done
             ;;
-        pacman) sudo_run pacman -S --needed --noconfirm "${pkgs[@]}" ;;
-        dnf)    sudo_run dnf install -y "${pkgs[@]}" ;;
+        pacman)
+            for p in "${pkgs[@]}"; do
+                sudo_run pacman -S --needed --noconfirm "$p" 2>/dev/null || warn "skipped: $p"
+            done
+            ;;
+        dnf)
+            for p in "${pkgs[@]}"; do
+                sudo_run dnf install -y "$p" 2>/dev/null || warn "skipped: $p"
+            done
+            ;;
     esac
 }
 
@@ -248,10 +263,29 @@ if [[ $CLI_ONLY == 0 ]]; then
 
     step "Desktop entry + icon"
     mkdir -p "$APPS_DIR" "$ICON_DIR"
-    cp -f "$SRC_DIR/data/io.thepriest.Athena.desktop" "$APPS_DIR/io.thepriest.Athena.desktop"
-    cp -f "$SRC_DIR/data/io.thepriest.Athena.svg"     "$ICON_DIR/io.thepriest.Athena.svg"
-    ok "app registered: $APPS_DIR/io.thepriest.Athena.desktop"
-    ok "icon installed:  $ICON_DIR/io.thepriest.Athena.svg"
+
+    # Look for desktop+icon in data/ (preferred) or repo root (legacy layout)
+    DESKTOP_SRC=""
+    ICON_SRC=""
+    for d in "$SRC_DIR/data" "$SRC_DIR"; do
+        [[ -z "$DESKTOP_SRC" && -f "$d/io.thepriest.Athena.desktop" ]] && DESKTOP_SRC="$d/io.thepriest.Athena.desktop"
+        [[ -z "$ICON_SRC"    && -f "$d/io.thepriest.Athena.svg"     ]] && ICON_SRC="$d/io.thepriest.Athena.svg"
+    done
+
+    if [[ -n "$DESKTOP_SRC" ]]; then
+        cp -f "$DESKTOP_SRC" "$APPS_DIR/io.thepriest.Athena.desktop"
+        ok "app registered: $APPS_DIR/io.thepriest.Athena.desktop"
+    else
+        warn "io.thepriest.Athena.desktop not found in repo — app icon won't appear in launcher"
+        warn "(run 'athena-gui' from terminal anyway)"
+    fi
+
+    if [[ -n "$ICON_SRC" ]]; then
+        cp -f "$ICON_SRC" "$ICON_DIR/io.thepriest.Athena.svg"
+        ok "icon installed:  $ICON_DIR/io.thepriest.Athena.svg"
+    else
+        warn "io.thepriest.Athena.svg not found — using default icon"
+    fi
 
     # Refresh caches (best-effort)
     if has update-desktop-database; then
