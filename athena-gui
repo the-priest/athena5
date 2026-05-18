@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# athena-gui — launches the Athena GTK4 GUI.
+# Resolves the install dir then execs athena_gui.py with system python.
+
+set -e
+
+for candidate in \
+    "${ATHENA_HOME:-}" \
+    "/opt/athena5" \
+    "$HOME/.local/share/athena5" \
+    "$HOME/Documents/athena5" \
+    "$HOME/athena5"
+do
+    if [[ -n "$candidate" && -f "$candidate/athena_gui.py" ]]; then
+        export ATHENA_SCRIPT="$candidate/athena.py"
+        exec /usr/bin/python3 "$candidate/athena_gui.py" "$@"
+    fi
+done
+
+echo "athena-gui: install dir not found. Reinstall with install.sh." >&2
+exit 1

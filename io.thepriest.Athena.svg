@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#1a0f2a"/>
+      <stop offset="100%" stop-color="#0a0612"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%"  stop-color="#cc66ff" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#cc66ff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <!-- Background rounded square -->
+  <rect x="0" y="0" width="128" height="128" rx="28" ry="28" fill="url(#bg)"/>
+  <circle cx="64" cy="64" r="44" fill="url(#glow)"/>
+
+  <!-- Owl silhouette -->
+  <g fill="#cc66ff" stroke="#cc66ff" stroke-linejoin="round" stroke-linecap="round">
+    <!-- Head/body -->
+    <path d="M 64 22
+             C 42 22 30 38 30 60
+             C 30 84 44 102 64 102
+             C 84 102 98 84 98 60
+             C 98 38 86 22 64 22 Z"
+          fill="#cc66ff" opacity="0.95"/>
+    <!-- Ear tufts -->
+    <path d="M 38 30 L 30 16 L 44 24 Z" fill="#cc66ff"/>
+    <path d="M 90 30 L 98 16 L 84 24 Z" fill="#cc66ff"/>
+  </g>
+
+  <!-- Eyes (dark) -->
+  <circle cx="50" cy="56" r="11" fill="#0a0612"/>
+  <circle cx="78" cy="56" r="11" fill="#0a0612"/>
+  <!-- Eye highlights (cyan/white) -->
+  <circle cx="50" cy="54" r="4" fill="#e6dcf0"/>
+  <circle cx="78" cy="54" r="4" fill="#e6dcf0"/>
+  <circle cx="50" cy="54" r="2" fill="#0a0612"/>
+  <circle cx="78" cy="54" r="2" fill="#0a0612"/>
+
+  <!-- Beak -->
+  <path d="M 64 64 L 60 74 L 68 74 Z" fill="#0a0612"/>
+
+  <!-- Chest feather lines -->
+  <g stroke="#0a0612" stroke-width="2" fill="none" stroke-linecap="round" opacity="0.5">
+    <path d="M 50 84 Q 64 90 78 84"/>
+    <path d="M 54 92 Q 64 96 74 92"/>
+  </g>
+</svg>

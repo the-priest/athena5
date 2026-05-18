@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Athena
+GenericName=Offensive Security Agent
+Comment=AI-driven pentesting copilot for Kali NetHunter
+Exec=athena-gui
+Icon=io.thepriest.Athena
+Terminal=false
+Categories=Security;Network;System;Utility;
+Keywords=security;pentest;hacking;ai;nethunter;kali;
+StartupNotify=true
+StartupWMClass=io.thepriest.Athena
+X-Purism-FormFactor=Workstation;Mobile;

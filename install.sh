@@ -1,159 +1,305 @@
 #!/usr/bin/env bash
-# Athena installer — sets up Python deps, /usr/local/bin shortcut,
-# ~/.athena directory, and (optionally) GROQ_API_KEY in your shell rc.
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║              ATHENA INSTALLER — v7.3 (GUI + CLI)                 ║
+# ║   Smart install: detects what's missing, installs only that.     ║
+# ║   Sets up both the CLI shortcut and the Phosh app icon.          ║
+# ╚══════════════════════════════════════════════════════════════════╝
 #
-# v7.2 — works correctly for both bash and zsh users.  v7.1 had a
-# detection bug where it always picked .bashrc because ZSH_VERSION is
-# only set inside zsh itself, not when zsh users run `bash install.sh`.
-# Now we detect the actual login shell via $SHELL and additionally
-# write to every rc file that already exists on the system, so the
-# install works regardless of which shell you launch later.
+# Usage:
+#   bash install.sh             # full install (CLI + GUI)
+#   bash install.sh --cli-only  # skip GTK/VTE, CLI only
+#   bash install.sh --gui-only  # skip the /usr/local/bin/athena CLI link
+#   bash install.sh --quiet     # less chatty
+#
+# Re-runnable.  Existing config / API keys are preserved.
 
 set -euo pipefail
 
-ATHENA_DIR="$HOME/.athena"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT="$SCRIPT_DIR/athena.py"
-TARGET="/usr/local/bin/athena"
-
-c_blue()   { printf '\033[34m%s\033[0m\n' "$*"; }
-c_green()  { printf '\033[32m%s\033[0m\n' "$*"; }
-c_yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
-c_red()    { printf '\033[31m%s\033[0m\n' "$*"; }
-
-c_blue "==> Athena installer (v7.2)"
-echo
-
-# ── Detect rc files to update ─────────────────────────────────────
-# Strategy: figure out the user's login shell from $SHELL (set by the
-# OS, not by whatever shell is running this script).  Then collect
-# every rc file that already exists — we'll write to all of them so
-# the install works in bash AND zsh sessions interchangeably.
-LOGIN_SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
-PRIMARY_RC="$HOME/.bashrc"
-case "$LOGIN_SHELL_NAME" in
-    zsh)  PRIMARY_RC="$HOME/.zshrc" ;;
-    bash) PRIMARY_RC="$HOME/.bashrc" ;;
-    *)    PRIMARY_RC="$HOME/.profile" ;;
-esac
-
-RC_FILES=()
-for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
-    [[ -f "$rc" ]] && RC_FILES+=("$rc")
+# ── flags ──────────────────────────────────────────────────────────
+CLI_ONLY=0
+GUI_ONLY=0
+QUIET=0
+for arg in "$@"; do
+    case "$arg" in
+        --cli-only) CLI_ONLY=1 ;;
+        --gui-only) GUI_ONLY=1 ;;
+        --quiet)    QUIET=1 ;;
+        -h|--help)
+            sed -n '8,15p' "$0"; exit 0 ;;
+    esac
 done
-# If the primary rc doesn't exist yet, create it (touch) so we can
-# write to it.  This handles a fresh user account.
-if [[ ! -f "$PRIMARY_RC" ]]; then
-    touch "$PRIMARY_RC"
-    RC_FILES+=("$PRIMARY_RC")
-fi
 
-c_green "[ok] login shell: $LOGIN_SHELL_NAME"
-c_green "[ok] will update: ${RC_FILES[*]}"
-
-# ── Python check ──────────────────────────────────────────────────
-if ! command -v python3 >/dev/null 2>&1; then
-    c_red "Python 3 not found. Install python3 (3.10+) and re-run."
-    exit 1
-fi
-
-PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-PY_OK=$(python3 -c 'import sys; print(1 if sys.version_info >= (3,10) else 0)')
-if [[ "$PY_OK" != "1" ]]; then
-    c_red "Python 3.10+ required, found $PY_VER"
-    exit 1
-fi
-c_green "[ok] Python $PY_VER"
-
-# ── Athena script presence ────────────────────────────────────────
-if [[ ! -f "$SCRIPT" ]]; then
-    c_red "athena.py not found at $SCRIPT"
-    exit 1
-fi
-chmod +x "$SCRIPT"
-c_green "[ok] athena.py present"
-
-# ── Python dependencies ───────────────────────────────────────────
-c_blue "==> Installing Python dependencies (groq, networkx)"
-PIP_FLAGS=""
-# Kali / Debian Bookworm+ ships PEP 668-protected Python — need this
-if pip3 install --help 2>&1 | grep -q -- "--break-system-packages"; then
-    PIP_FLAGS="--break-system-packages"
-fi
-if ! pip3 install -q $PIP_FLAGS -r "$SCRIPT_DIR/requirements.txt"; then
-    c_yellow "[!] pip install failed — trying with --user"
-    pip3 install -q --user $PIP_FLAGS -r "$SCRIPT_DIR/requirements.txt"
-fi
-c_green "[ok] dependencies installed"
-
-# ── Athena directory ──────────────────────────────────────────────
-mkdir -p "$ATHENA_DIR/logs"
-c_green "[ok] $ATHENA_DIR/"
-
-# ── Symlink to /usr/local/bin (or fall back to alias) ─────────────
-LINK_OK=0
-if sudo -n true 2>/dev/null || [[ -w "/usr/local/bin" ]]; then
-    if [[ -L "$TARGET" || -e "$TARGET" ]]; then
-        sudo rm -f "$TARGET" 2>/dev/null || rm -f "$TARGET"
-    fi
-    if [[ -w "/usr/local/bin" ]]; then
-        ln -s "$SCRIPT" "$TARGET"
-    else
-        sudo ln -s "$SCRIPT" "$TARGET"
-    fi
-    c_green "[ok] $TARGET → $SCRIPT"
-    LINK_OK=1
+# ── colours ────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+    BLU=$'\033[34m'; GRN=$'\033[32m'; YEL=$'\033[33m'
+    RED=$'\033[31m'; DIM=$'\033[90m'; MAG=$'\033[35m'; RST=$'\033[0m'
 else
-    c_yellow "==> sudo not available — adding 'athena' alias to your rc files"
-    for rc in "${RC_FILES[@]}"; do
-        if ! grep -q "^alias athena=" "$rc" 2>/dev/null; then
-            echo "alias athena='python3 $SCRIPT'" >> "$rc"
-            c_green "[ok] alias added to $rc"
-        else
-            c_green "[ok] alias already present in $rc"
+    BLU= GRN= YEL= RED= DIM= MAG= RST=
+fi
+say()  { [[ $QUIET == 1 ]] || printf '%s\n' "$*"; }
+ok()   { say "${GRN}[ok]${RST} $*"; }
+warn() { printf '%s\n' "${YEL}[!]${RST}  $*" >&2; }
+err()  { printf '%s\n' "${RED}[x]${RST}  $*" >&2; }
+step() { say ""; say "${BLU}==>${RST} ${MAG}$*${RST}"; }
+
+# ── banner ─────────────────────────────────────────────────────────
+if [[ $QUIET == 0 ]]; then
+cat <<EOF
+${MAG}
+   █████╗ ████████╗██╗  ██╗███████╗███╗   ██╗ █████╗
+  ██╔══██╗╚══██╔══╝██║  ██║██╔════╝████╗  ██║██╔══██╗
+  ███████║   ██║   ███████║█████╗  ██╔██╗ ██║███████║
+  ██╔══██║   ██║   ██╔══██║██╔══╝  ██║╚██╗██║██╔══██║
+  ██║  ██║   ██║   ██║  ██║███████╗██║ ╚████║██║  ██║
+  ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝${DIM}
+                 v7.3 · GUI + CLI installer${RST}
+
+EOF
+fi
+
+# ── paths ──────────────────────────────────────────────────────────
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="${ATHENA_INSTALL_DIR:-/opt/athena5}"
+DATA_DIR="$HOME/.athena"
+APPS_DIR="$HOME/.local/share/applications"
+ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+CLI_BIN="/usr/local/bin/athena"
+GUI_BIN="/usr/local/bin/athena-gui"
+
+# ── helpers ────────────────────────────────────────────────────────
+has() { command -v "$1" >/dev/null 2>&1; }
+
+# Run a command with sudo only when needed and available.
+sudo_run() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    elif has sudo; then
+        sudo "$@"
+    else
+        warn "sudo not available — skipping: $*"
+        return 1
+    fi
+}
+
+# Detect package manager (apt only for now — extend if needed)
+PKG=""
+if has apt-get; then PKG="apt"
+elif has pacman; then PKG="pacman"
+elif has dnf;    then PKG="dnf"
+else
+    warn "no supported package manager found — system deps must be installed manually"
+fi
+
+# Map logical dep → distro package name
+declare -A PKG_APT=(
+    [python3]=python3
+    [pip]=python3-pip
+    [git]=git
+    [gtk4]=libgtk-4-1
+    [adw]=gir1.2-adw-1
+    [pygobject]=python3-gi
+    [pygobject-cairo]=python3-gi-cairo
+    [fonts]=fonts-jetbrains-mono
+)
+declare -A PKG_PAC=(
+    [python3]=python
+    [pip]=python-pip
+    [git]=git
+    [gtk4]=gtk4
+    [adw]=libadwaita
+    [pygobject]=python-gobject
+    [pygobject-cairo]=python-cairo
+    [fonts]=ttf-jetbrains-mono
+)
+declare -A PKG_DNF=(
+    [python3]=python3
+    [pip]=python3-pip
+    [git]=git
+    [gtk4]=gtk4
+    [adw]=libadwaita
+    [pygobject]=python3-gobject
+    [pygobject-cairo]=python3-cairo
+    [fonts]=jetbrains-mono-fonts
+)
+
+pkg_name() {
+    local key="$1"
+    case "$PKG" in
+        apt)    echo "${PKG_APT[$key]:-}" ;;
+        pacman) echo "${PKG_PAC[$key]:-}" ;;
+        dnf)    echo "${PKG_DNF[$key]:-}" ;;
+    esac
+}
+
+# Check whether a package is installed (apt only — best-effort elsewhere)
+pkg_installed() {
+    local name="$1"
+    case "$PKG" in
+        apt)    dpkg-query -W -f='${Status}' "$name" 2>/dev/null | grep -q 'install ok installed' ;;
+        pacman) pacman -Qi "$name" >/dev/null 2>&1 ;;
+        dnf)    rpm -q "$name" >/dev/null 2>&1 ;;
+        *)      return 1 ;;
+    esac
+}
+
+pkg_install_many() {
+    local pkgs=()
+    for key in "$@"; do
+        local n; n="$(pkg_name "$key")"
+        [[ -z "$n" ]] && continue
+        if ! pkg_installed "$n"; then
+            pkgs+=("$n")
         fi
     done
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        ok "all system packages already present"
+        return 0
+    fi
+    say "    installing: ${pkgs[*]}"
+    case "$PKG" in
+        apt)
+            sudo_run apt-get update -qq || true
+            sudo_run apt-get install -y --no-install-recommends "${pkgs[@]}"
+            ;;
+        pacman) sudo_run pacman -S --needed --noconfirm "${pkgs[@]}" ;;
+        dnf)    sudo_run dnf install -y "${pkgs[@]}" ;;
+    esac
+}
+
+# ── 1. Python check ────────────────────────────────────────────────
+step "Python 3.10+"
+if ! has python3; then
+    err "python3 missing"
+    [[ -n "$PKG" ]] && pkg_install_many python3 pip || exit 1
+fi
+PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+PY_OK=$(python3 -c 'import sys; print(1 if sys.version_info >= (3,10) else 0)')
+[[ "$PY_OK" == "1" ]] || { err "Python 3.10+ required, found $PY_VER"; exit 1; }
+ok "Python $PY_VER"
+
+# ── 2. system deps ─────────────────────────────────────────────────
+if [[ $CLI_ONLY == 0 && -n "$PKG" ]]; then
+    step "System packages (GTK4 · libadwaita · python3-gi)"
+    pkg_install_many gtk4 adw pygobject pygobject-cairo fonts pip git || true
+else
+    step "System packages (CLI only)"
+    [[ -n "$PKG" ]] && pkg_install_many pip git || true
 fi
 
-# ── GROQ_API_KEY ──────────────────────────────────────────────────
-# Skip the prompt entirely if either:
-#   (a) GROQ_API_KEY is already set in the current environment, or
-#   (b) any of the rc files we'd write to already contains it.
-HAS_KEY_IN_RC=0
-for rc in "${RC_FILES[@]}"; do
-    if grep -q "GROQ_API_KEY" "$rc" 2>/dev/null; then
-        HAS_KEY_IN_RC=1
-        break
+# ── 3. python deps ─────────────────────────────────────────────────
+step "Python dependencies"
+PIP_FLAGS=()
+if pip3 install --help 2>&1 | grep -q -- "--break-system-packages"; then
+    PIP_FLAGS+=("--break-system-packages")
+fi
+if ! pip3 install --quiet "${PIP_FLAGS[@]}" -r "$SRC_DIR/requirements.txt"; then
+    warn "system pip failed — retrying with --user"
+    pip3 install --quiet --user "${PIP_FLAGS[@]}" -r "$SRC_DIR/requirements.txt"
+fi
+ok "groq · networkx installed"
+
+# ── 4. copy files to install dir ───────────────────────────────────
+step "Install files → $INSTALL_DIR"
+PARENT_DIR="$(dirname "$INSTALL_DIR")"
+if [[ -d "$INSTALL_DIR" && -w "$INSTALL_DIR" ]] || [[ ! -d "$INSTALL_DIR" && -w "$PARENT_DIR" ]]; then
+    mkdir -p "$INSTALL_DIR"
+else
+    sudo_run mkdir -p "$INSTALL_DIR"
+    sudo_run chown "$USER:$USER" "$INSTALL_DIR"
+fi
+
+for f in athena.py athena_gui.py athena-gui requirements.txt README.md; do
+    if [[ -f "$SRC_DIR/$f" ]]; then
+        cp -f "$SRC_DIR/$f" "$INSTALL_DIR/$f"
     fi
 done
+chmod +x "$INSTALL_DIR/athena.py" "$INSTALL_DIR/athena-gui" 2>/dev/null || true
+ok "files copied"
 
-if [[ -z "${GROQ_API_KEY:-}" && "$HAS_KEY_IN_RC" == "0" ]]; then
-    echo
-    c_yellow "==> No GROQ_API_KEY found in your environment or rc files"
-    echo "    Get a free key at: https://console.groq.com (no credit card)"
-    read -r -p "    Paste your Groq API key (or press Enter to skip): " key
-    if [[ -n "$key" ]]; then
-        for rc in "${RC_FILES[@]}"; do
-            echo "export GROQ_API_KEY=$key" >> "$rc"
-            c_green "[ok] GROQ_API_KEY written to $rc"
-        done
-        c_yellow "    Reload your shell:  source $PRIMARY_RC"
+# ── 5. ~/.athena dirs ──────────────────────────────────────────────
+mkdir -p "$DATA_DIR/logs"
+ok "$DATA_DIR/ ready"
+
+# ── 6. CLI symlink ─────────────────────────────────────────────────
+if [[ $GUI_ONLY == 0 ]]; then
+    step "CLI shortcut: $CLI_BIN"
+    if sudo_run ln -sf "$INSTALL_DIR/athena.py" "$CLI_BIN" 2>/dev/null; then
+        ok "$CLI_BIN → $INSTALL_DIR/athena.py"
     else
-        c_yellow "[!] Skipped. Set GROQ_API_KEY before running athena."
+        warn "no sudo — adding alias to shell rc files instead"
+        for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+            [[ -f "$rc" ]] || continue
+            if ! grep -q "^alias athena=" "$rc" 2>/dev/null; then
+                printf "alias athena='python3 %s'\n" "$INSTALL_DIR/athena.py" >> "$rc"
+                ok "alias added to $rc"
+            fi
+        done
     fi
 fi
 
-# ── Optional: copy example scope to ~/.athena if not present ──────
-if [[ ! -f "$ATHENA_DIR/scope.json" && -f "$SCRIPT_DIR/scope.example.json" ]]; then
-    cp "$SCRIPT_DIR/scope.example.json" "$ATHENA_DIR/scope.json"
-    c_green "[ok] example scope.json copied to $ATHENA_DIR/"
+# ── 7. GUI launcher + desktop entry + icon ─────────────────────────
+if [[ $CLI_ONLY == 0 ]]; then
+    step "GUI shortcut: $GUI_BIN"
+    if sudo_run ln -sf "$INSTALL_DIR/athena-gui" "$GUI_BIN" 2>/dev/null; then
+        ok "$GUI_BIN → $INSTALL_DIR/athena-gui"
+    else
+        warn "no sudo — $GUI_BIN not linked (run athena-gui from $INSTALL_DIR)"
+    fi
+
+    step "Desktop entry + icon"
+    mkdir -p "$APPS_DIR" "$ICON_DIR"
+    cp -f "$SRC_DIR/data/io.thepriest.Athena.desktop" "$APPS_DIR/io.thepriest.Athena.desktop"
+    cp -f "$SRC_DIR/data/io.thepriest.Athena.svg"     "$ICON_DIR/io.thepriest.Athena.svg"
+    ok "app registered: $APPS_DIR/io.thepriest.Athena.desktop"
+    ok "icon installed:  $ICON_DIR/io.thepriest.Athena.svg"
+
+    # Refresh caches (best-effort)
+    if has update-desktop-database; then
+        update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
+    fi
+    if has gtk-update-icon-cache; then
+        gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+    fi
 fi
 
-echo
-c_blue "==> Install complete"
-if [[ "$LINK_OK" == "1" ]]; then
-    echo "    Run:  athena"
+# ── 8. GROQ_API_KEY ────────────────────────────────────────────────
+step "Groq API key"
+KEY_IN_RC=0
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [[ -f "$rc" ]] && grep -q "GROQ_API_KEY" "$rc" && KEY_IN_RC=1 && break
+done
+if [[ -z "${GROQ_API_KEY:-}" && $KEY_IN_RC == 0 ]]; then
+    if [[ -t 0 ]]; then
+        warn "GROQ_API_KEY not set"
+        say "    Free key (no card): https://console.groq.com"
+        read -r -p "    Paste key (or Enter to skip and set later in the GUI): " key
+        if [[ -n "${key:-}" ]]; then
+            for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+                [[ -f "$rc" ]] || continue
+                printf "export GROQ_API_KEY=%s\n" "$key" >> "$rc"
+                ok "key written to $rc"
+            done
+        else
+            warn "skipped — set later via GUI ▸ ⋮ ▸ API key…"
+        fi
+    else
+        warn "GROQ_API_KEY not set — paste it in the GUI on first launch"
+    fi
 else
-    echo "    Run:  source $PRIMARY_RC && athena"
+    ok "GROQ_API_KEY already configured"
 fi
-echo
+
+# ── done ───────────────────────────────────────────────────────────
+say ""
+say "${GRN}${MAG}╭──────────────────────────────────────────────────╮${RST}"
+say "${GRN}${MAG}│${RST}  install complete                                ${MAG}│${RST}"
+say "${GRN}${MAG}├──────────────────────────────────────────────────┤${RST}"
+if [[ $CLI_ONLY == 0 ]]; then
+say "${MAG}│${RST}  ${GRN}GUI${RST}   tap the Athena icon in your app grid    ${MAG}│${RST}"
+say "${MAG}│${RST}        or run:  ${YEL}athena-gui${RST}                       ${MAG}│${RST}"
+fi
+if [[ $GUI_ONLY == 0 ]]; then
+say "${MAG}│${RST}  ${GRN}CLI${RST}   run:  ${YEL}athena${RST}                            ${MAG}│${RST}"
+fi
+say "${GRN}${MAG}╰──────────────────────────────────────────────────╯${RST}"
+say ""
