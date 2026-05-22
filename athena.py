@@ -1,60 +1,18 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║           ATHENA — AI Offensive Security Agent v7.2              ║
+║           ATHENA — AI Offensive Security Agent v7.3              ║
 ║   Bare-metal Kali NetHunter  ·  Commander: The Priest             ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
-║   v7.2 — RELIABILITY + UI OVERHAUL                               ║
+║   v7.3 — TOKEN SAVINGS + BUG FIXES                               ║
 ║                                                                  ║
-║   FIXES (from v7.1 field-test failures)                          ║
-║   • Tool dispatch no longer silently drops unknown kwargs.       ║
-║     Common synonyms (skip_host_discovery, scan_type,             ║
-║     timing_template, open_only, ...) are mapped to real flags.   ║
-║     Truly unknown kwargs become a hard error fed back into the   ║
-║     LLM's NEXT prompt — so it can correct, not loop.             ║
-║   • Sudo escalation: when a command fails with permission        ║
-║     denied / CAP_NET_RAW / requires-root markers, Athena         ║
-║     offers to re-run with sudo (one-tap retry).                  ║
-║   • Tool availability is checked BEFORE dispatch.  Missing       ║
-║     binaries raise a structured error so the LLM pivots.         ║
-║   • Type-safe scripts param: list/dict/json artifacts in the     ║
-║     `scripts` arg are normalised to a comma-separated string.    ║
-║   • Loop-breaker: same shell command twice → forced agent        ║
-║     rotation + RED conf override.  Three times → handle_stuck.   ║
-║   • Confidence is failure-aware: N consecutive fails on a node   ║
-║     forces RED regardless of the LLM's self-rating.  Workflow    ║
-║     CANNOT auto-complete on a streak of failures.                ║
-║   • Phosh UI guard now confirms the package is INSTALLED         ║
-║     (dpkg-query) before flagging — no more false-alarms on a     ║
-║     phone where xfce was never installed.                        ║
-║   • Per-command timeouts: top-ports/short scans 90s,             ║
-║     full-range scans 600s, brute-force tools 1800s.              ║
-║   • Boot lock auto-expires after 6h.                             ║
+║   FIXES: provider chain stripped of 404-ing models,             ║
+║   instance vars properly initialized, output compression         ║
+║   improved, KB sections capped, tools block gated.               ║
 ║                                                                  ║
-║   UI OVERHAUL                                                    ║
-║   • Every turn renders as a stack of titled boxes:               ║
-║       ┌─ TURN N · target · agent · findings · ATT&CK · model ─┐  ║
-║       ┌─ THOUGHT ─┐                                              ║
-║       ┌─ DISPATCH ─┐                                             ║
-║       ┌─ COMMAND  conf=GREEN  ATT&CK=T1046 ─┐                    ║
-║       ┌─ EXECUTING ─┐ ... ┌─ RESULT ─┐                           ║
-║       ┌─ FINDINGS +N ─┐                                          ║
-║       ┌─ ⛔ ERROR ─┐  for permission/scope/destructive          ║
-║   • Persistent status bar still rendered before each prompt.     ║
-║                                                                  ║
-║   PRESERVED FROM v7.1                                            ║
-║   • Pentesting Task Tree (PTT)                                   ║
-║   • 11 specialist agents, deterministic dispatch                 ║
-║   • 28+ structured tool builders                                 ║
-║   • MITRE ATT&CK auto-tagging                                    ║
-║   • Scope / RoE enforcement                                      ║
-║   • Attack graph (networkx)                                      ║
-║   • Smart context manager + [NEED] re-fetches                    ║
-║   • Auto credential fanout                                       ║
-║   • Comprehensive Kali tool registry — 200+ tools                ║
-║   • Groq provider chain                                          ║
-║   • No on-disk persistence (except scope + logs + reports)       ║
+║   PRESERVED FROM v7.2: PTT, 11 specialist agents, 28+ tools,    ║
+║   MITRE ATT&CK, scope/RoE, attack graph, Groq chain.            ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -97,21 +55,21 @@ except ImportError:
 # VERSION & PROVIDER CHAIN  (Groq only, biggest→smallest)
 # ═════════════════════════════════════════════════════════════════════
 
-VERSION = "7.2"
+VERSION = "7.3"
 
-# v7.4 — CHEAP-FIRST chain.  Lead with smaller/faster models to save the
-# free-tier budget.  Fall up to bigger models only when small ones fail
-# (rate-limit, 404, or parsing error).  This cut API spend ~6x in testing.
+# v7.3 — CHEAP-FIRST chain, verified Groq models only.
+# openai/gpt-oss-* and allam-2-7b were 404-ing constantly and burning
+# retries.  groq/compound paths renamed to their correct API names.
+# Added gemma2-9b-it and deepseek-r1-distill-llama-70b as solid fallbacks.
 PROVIDER_CHAIN = [
-    ("llama-3.1-8b-instant",                           "LLaMA 3.1 8B"),
-    ("meta-llama/llama-4-scout-17b-16e-instruct",      "LLaMA 4 Scout 17B"),
-    ("openai/gpt-oss-20b",                             "GPT-OSS 20B"),
+    ("llama-3.1-8b-instant",                          "LLaMA 3.1 8B"),
+    ("gemma2-9b-it",                                   "Gemma 2 9B"),
+    ("meta-llama/llama-4-scout-17b-16e-instruct",     "LLaMA 4 Scout 17B"),
     ("qwen/qwen3-32b",                                 "Qwen3 32B"),
     ("llama-3.3-70b-versatile",                        "LLaMA 3.3 70B"),
-    ("openai/gpt-oss-120b",                            "GPT-OSS 120B"),
-    ("allam-2-7b",                                     "Allam 2 7B"),
-    ("groq/compound",                                  "Groq Compound"),
-    ("groq/compound-mini",                             "Compound Mini"),
+    ("deepseek-r1-distill-llama-70b",                  "DeepSeek R1 70B"),
+    ("compound-beta-mini",                             "Compound Beta Mini"),
+    ("compound-beta",                                  "Compound Beta"),
 ]
 
 
@@ -124,12 +82,17 @@ LOG_DIR     = os.path.join(INSTALL_DIR, "logs")
 SCOPE_FILE  = os.path.join(INSTALL_DIR, "scope.json")
 BOOT_LOCK   = "/tmp/athena_session.lock"
 
-# v7.4 — smart context: keep more in memory, send less by default
+# v7.3 — smart context: keep more in memory, send less by default
 MAX_HISTORY_MESSAGES   = 32   # how many turns kept in RAM
-DEFAULT_HISTORY_SLICE  = 3    # how many sent to API by default (was 4)
-EXPANDED_HISTORY_SLICE = 8    # when stuck/yellow/red conf (was 10)
-MAX_OUTPUT_CHARS       = 4000 # cap subprocess output sent back to model
+DEFAULT_HISTORY_SLICE  = 3    # how many sent to API by default
+EXPANDED_HISTORY_SLICE = 6    # when stuck/yellow/red conf (was 8 — trimmed)
+MAX_OUTPUT_CHARS       = 4000 # cap subprocess output sent back to model (exploit paths)
 MAX_TOKENS_DEFAULT     = 1024 # was 2048 — most turns finish well under this
+
+# v7.3 — tools/registry blocks are large (~2800 chars combined).  Send them
+# only on the first N turns so the model learns the tool set, then drop
+# them to save tokens.  Operator can request them back with [NEED]tools[/NEED].
+TOOLS_BLOCK_TURNS      = 2    # include tools+registry only for turn_no <= this
 WORKFLOW_DONE          = "WORKFLOW_COMPLETE"
 
 # How many [NEED] re-fetches allowed per turn (prevents runaway loops)
@@ -1109,22 +1072,25 @@ KEYWORD_KB_MAP = {
 def get_kb_sections(workflow_key: Optional[str] = None,
                     prompt_text: str = "",
                     agent_role: str = "") -> str:
-    """Return only the KB sections relevant to this workflow / agent / prompt."""
+    """Return only the KB sections relevant to this workflow / agent / prompt.
+    v7.3: capped at 3 sections max for normal turns to save tokens.
+    """
     section_nums = {1}  # mindset always
 
     if workflow_key and workflow_key in WORKFLOW_KB_MAP:
         section_nums.update(WORKFLOW_KB_MAP[workflow_key])
 
-    # Agent-role-driven KB selection
+    # Agent-role-driven KB selection — v7.3: trimmed to 2-3 sections max
+    # (removed KB 14 from most roles; it's generic and repeats other guidance)
     role_map = {
-        "recon":           [2, 8, 13, 14, 16],
-        "web":             [3, 8, 13, 14, 15],
-        "network":         [2, 8, 11, 13],
-        "ad":              [4, 10, 11, 13],
-        "linux_privesc":   [5, 7, 14],
-        "windows_privesc": [6, 7, 10],
+        "recon":           [2, 8, 13],
+        "web":             [3, 8, 15],
+        "network":         [2, 8, 13],
+        "ad":              [4, 10],
+        "linux_privesc":   [5, 7],
+        "windows_privesc": [6, 10],
         "credential":      [10, 12],
-        "exfil":           [7, 9, 12],
+        "exfil":           [7, 9],
         "evasion":         [9, 2],
         "reporter":        [14],
         "strategist":      [1, 14],
@@ -1137,9 +1103,16 @@ def get_kb_sections(workflow_key: Optional[str] = None,
         for pattern, nums in KEYWORD_KB_MAP.items():
             if re.search(pattern, lower):
                 section_nums.update(nums)
+                break  # v7.3: stop after first keyword match to limit sections
 
     if len(section_nums) == 1:
-        section_nums.update([2, 14])
+        section_nums.update([2])  # v7.3: was [2, 14] — 14 is generic
+
+    # v7.3 — hard cap: never send more than 4 sections (1 always + 3 role/kw)
+    # KB 1 stays. Trim the extras to the lowest-numbered (most fundamental)
+    if len(section_nums) > 4:
+        sorted_nums = sorted(section_nums)
+        section_nums = set(sorted_nums[:4])
 
     parts = []
     for num in sorted(section_nums):
@@ -1965,7 +1938,9 @@ def analyze_and_suggest_exploit(cve: str, target: str, lhost: str) -> str:
 def compress_output_for_history(output: str,
                                 is_exploit_result: bool = False) -> str:
     """Aggressive compression of terminal output for AI context.
-    Exploit results are kept intact (creds/shells matter)."""
+    Exploit results are kept intact (creds/shells matter).
+    v7.3: tighter trim (1600 chars max, 650+500 head/tail) and extra noise patterns.
+    """
     if is_exploit_result:
         return output[:MAX_OUTPUT_CHARS]
 
@@ -1981,6 +1956,12 @@ def compress_output_for_history(output: str,
         r'^\(Reading database', r'^Get:\d', r'^Hit:\d', r'^Ign:\d',
         r'^Fetched ', r'^WARNING:.*Cannot open MAC',
         r'^Starting Nmap', r'^Nmap done:', r'^Nmap scan report',
+        r'^NSE: ', r'^Initiating', r'^Completed ',   # v7.3: nmap progress lines
+        r'^\s*#\s*$',                                  # v7.3: bare comment lines
+        r'^Hydra v', r'^Hydra \(https',                # v7.3: hydra banner
+        r'^HYDRA_PROXY', r'^WARNING: Restoring',       # v7.3: hydra noise
+        r'^\[DATA\] max \d+ task',                     # v7.3: hydra data lines
+        r'^\[STATUS\]',                                # v7.3: hydra status
     ]))
 
     cleaned, last = [], None
@@ -1990,16 +1971,17 @@ def compress_output_for_history(output: str,
             continue
         if line == last:
             continue
-        if len(line) > 240:
-            line = line[:240] + "..."
+        if len(line) > 220:
+            line = line[:220] + "..."
         cleaned.append(line)
         last = line
 
     result = '\n'.join(cleaned).strip()
-    if len(result) > 1800:
-        head = result[:800]
-        tail = result[-600:]
-        result = f"{head}\n[...{len(result)-1400} chars trimmed...]\n{tail}"
+    # v7.3: tighter cap — 1600 chars max (was 1800), head+tail split
+    if len(result) > 1600:
+        head = result[:650]
+        tail = result[-500:]
+        result = f"{head}\n[...{len(result)-1150} chars trimmed...]\n{tail}"
     return result or "(no useful output)"
 
 
@@ -3852,45 +3834,27 @@ WORKFLOWS = {
 # [THOUGHT] panels directly so we never spend extra API calls on UI fluff.
 MENTOR_PERSONA = (
     "── ATHENA — VOICE & TEACHING DUTY ──\n"
-    "You are Athena: ex-NSA, fifteen years red-team, now babysitting a\n"
-    "junior operator codenamed The Priest. You've seen every CTF, every box,\n"
-    "every dumb script kiddie mistake. You speak like a senior to a junior:\n"
-    "direct, blunt, zero hedging. No 'I am an AI' disclaimers. No apologies.\n"
-    "Dry humour and sharp edges are welcome. Profanity if it fits.\n"
-    "\n"
-    "VOICE:\n"
-    " - Pentester slang is natural: pwn, foothold, low-hang, banner-grab,\n"
-    "   spray, kerberoast, dirty SMB, fat-finger, ricochet, foothold flip.\n"
-    " - When the operator picks something stupid — loud scan on a hot net,\n"
-    "   brute force without spraying, wrong tool for the surface — ROAST.\n"
-    "   Not nasty. Like a coach who wants them to win:\n"
-    "     'nmap -T5 -A on a corp net? gg, you're in someone's pcap already.'\n"
-    "     'Hydra default list on SSH port 22? fail2ban exists, buddy.'\n"
-    "     'You ran linpeas before id/sudo -l? Slow down, jesus.'\n"
-    " - When they nail it: short nod. 'good — that's the move.'\n"
-    " - Cite REAL CVEs, REAL tool flags, REAL paths. Never invent.\n"
+    "You are Athena: ex-NSA, fifteen years red-team. You speak to The Priest\n"
+    "like a senior to a junior: direct, blunt, zero hedging, no AI disclaimers.\n"
+    "Dry humour and sharp edges welcome. Profanity if it fits.\n"
+    "When the operator picks something loud/wrong: roast briefly like a coach.\n"
+    "When they nail it: short nod. Cite REAL CVEs and REAL flags. Never invent.\n"
     "\n"
     "TEACHING DUTY — every [THOUGHT] block MUST contain:\n"
     " 1. WHY this command (one sentence, plain English).\n"
     " 2. WHAT to watch for in the output (one sentence).\n"
-    " 3. IF the last result showed a screw-up by the operator or by you —\n"
-    "    out-of-scope, missed low-hang, loud when should've been quiet,\n"
-    "    wrong tool for the layer — call it out briefly. Don't gloss.\n"
+    " 3. If the last result showed a mistake — call it out briefly.\n"
     "\n"
-    "MANUAL HAND-OFFS — when the next move needs the HUMAN to do something\n"
-    "you can't (interactive shell, browser UI, physical access, screenshot,\n"
-    "OOB callback listener setup, decoding a binary in Ghidra), emit:\n"
+    "MANUAL HAND-OFFS — when the next move needs the human (interactive shell,\n"
+    "browser UI, physical access, OOB listener setup), emit:\n"
     "    [MANUAL]\n"
     "    1. <first concrete step — exact command or click path>\n"
     "    2. <second step>\n"
-    "    3. <…>\n"
     "    [/MANUAL]\n"
-    "Keep it to 3-5 numbered steps. The GUI renders this as a manual\n"
-    "playbook card for the operator.\n"
+    "Keep to 3-5 numbered steps.\n"
     "\n"
     "STUCK-DETECTION — if the operator types 'stuck', 'idk', 'help', or\n"
-    "'wtf', drop the next [CMD] and instead emit a [MANUAL] block with\n"
-    "concrete next moves they should try by hand. Then continue normally."
+    "'wtf', drop the next [CMD] and emit [MANUAL] with concrete next moves."
 )
 
 
@@ -3904,21 +3868,19 @@ CORE_RULES = (
     "  [CONF]<green|yellow|red>[/CONF]\n"
     "  Optional: [VERIFY]<command to verify a finding>[/VERIFY]\n"
     "  Optional: [HANDOFF]<other agent role>[/HANDOFF]\n"
-    "  Optional: [NEED]<ptt|history|findings|graph|kb N>[/NEED]\n"
-    "    Use [NEED] when you require more state than the minimal context\n"
-    "    provided.  The system will re-call you with that data attached.\n"
-    "    Examples: [NEED]ptt[/NEED]   [NEED]graph[/NEED]   [NEED]kb 4[/NEED]\n"
+    "  Optional: [NEED]<ptt|history|findings|graph|tools|kb N>[/NEED]\n"
+    "    Use [NEED] when you require more state than the minimal context.\n"
+    "    [NEED]tools[/NEED] re-attaches the full Kali arsenal + tool registry.\n"
+    "    Examples: [NEED]ptt[/NEED]  [NEED]graph[/NEED]  [NEED]kb 4[/NEED]\n"
     "\n"
     "TOOL FORMAT EXAMPLES:\n"
     '  [TOOL]nmap[/TOOL][ARGS]{"target":"10.0.0.5","top_ports":1000,"version":true}[/ARGS]\n'
     '  [TOOL]gobuster_dir[/TOOL][ARGS]{"url":"http://10.0.0.5","wordlist":"/usr/share/wordlists/dirb/common.txt"}[/ARGS]\n'
-    '  [TOOL]hydra[/TOOL][ARGS]{"target":"10.0.0.5","service":"ssh","userlist":"/tmp/u.txt","passlist":"/tmp/p.txt"}[/ARGS]\n'
-    '  [TOOL]searchsploit[/TOOL][ARGS]{"query":"vsftpd 2.3.4"}[/ARGS]\n'
     "\n"
     "WHEN TO USE [TOOL] vs [CMD]:\n"
-    " - [TOOL] for any tool listed in the registry — guarantees flag correctness.\n"
-    " - [CMD] for: custom curl payloads, one-off pipes (nmap | grep | awk),\n"
-    "   sed/awk parsing, manual SQL probes, anything not in the registry.\n"
+    " - [TOOL] for any tool in the registry — guarantees flag correctness.\n"
+    " - [CMD] for: custom curl payloads, one-off pipes, sed/awk parsing,\n"
+    "   manual SQL probes, anything not in the registry.\n"
     "\n"
     "RULES:\n"
     " - Never repeat a command verbatim.\n"
@@ -3934,11 +3896,9 @@ CORE_RULES = (
     " - Cite CVSS/CVE numbers in [THOUGHT] where relevant.\n"
     " - Reason from real subprocess output only — not from prior assumptions.\n"
     " - TEACHING: every [THOUGHT] must say WHY this cmd + WHAT to watch for.\n"
-    "   When operator screws up (loud scan, wrong tool, missed low-hang),\n"
-    "   call it briefly. Coach, don't sugar-coat.\n"
     " - MANUAL: when the next move needs the human (browser, interactive\n"
-    "   shell, GUI tool, listener setup, OOB callback), drop the [CMD]\n"
-    "   and emit [MANUAL]<numbered steps>[/MANUAL] instead.\n"
+    "   shell, GUI tool, listener setup), drop the [CMD] and emit\n"
+    "   [MANUAL]<numbered steps>[/MANUAL] instead.\n"
     " - If operator types 'stuck'/'help'/'idk'/'wtf', skip [CMD] and emit\n"
     "   [MANUAL] with 3-5 concrete next moves."
 )
@@ -3955,14 +3915,15 @@ def build_system_prompt(agent_role: str,
                         graph: Optional["AttackGraph"] = None,
                         scope: Optional["ScopeConfig"] = None,
                         force_full: bool = False,
-                        need_attachments: Optional[List[str]] = None) -> str:
+                        need_attachments: Optional[List[str]] = None,
+                        turn_no: int = 0) -> str:
     """Compose system prompt for the chosen specialist agent.
 
-    v7.1 — minimal context by default, expanded on demand.
-    Includes: agent persona + extra rules + KB sections + active node +
-    findings summary + Kali tool registry summary + structured tool
-    registry + core rules.  When force_full=True or [NEED] tags trigger,
-    extra context is attached.
+    v7.3 — token-saving improvements:
+    - tools_block and structured_block only sent for turn_no <= TOOLS_BLOCK_TURNS
+      or when 'tools' in need_attachments. Saves ~2800 chars on every
+      subsequent turn.
+    - KB sections capped at 4 (see get_kb_sections).
     """
     spec = AGENT_SPECS.get(agent_role, AGENT_SPECS["recon"])
     need_attachments = need_attachments or []
@@ -4098,11 +4059,14 @@ def build_system_prompt(agent_role: str,
             except (ValueError, IndexError):
                 pass
 
-    # Kali tools available (compact)
-    tools_block = kali_tool_summary_for_prompt()
+    # Kali tools available (compact) — only on first TOOLS_BLOCK_TURNS turns
+    # or when operator explicitly requests them via [NEED]tools[/NEED].
+    # After that the model already knows the arsenal; re-sending wastes ~600 chars.
+    include_tools = turn_no <= TOOLS_BLOCK_TURNS or "tools" in need_attachments
+    tools_block = kali_tool_summary_for_prompt() if include_tools else ""
 
-    # NEW: structured tool registry for [TOOL]/[ARGS] format
-    structured_block = tool_registry_for_prompt()
+    # Structured tool registry — same gate as tools_block (~2200 chars saved/turn)
+    structured_block = tool_registry_for_prompt() if include_tools else ""
 
     # Scope reminder
     scope_block = ""
@@ -4137,8 +4101,10 @@ def build_system_prompt(agent_role: str,
     parts.append(ptt_block)
     if graph_block:
         parts.append(graph_block)
-    parts.append(structured_block)
-    parts.append(tools_block)
+    if structured_block:
+        parts.append(structured_block)
+    if tools_block:
+        parts.append(tools_block)
     parts.append("KNOWLEDGE BASE:\n" + kb_text)
     parts.append(CORE_RULES)
     return "\n\n".join(parts)
@@ -4248,6 +4214,16 @@ class AthenaSession:
         # Provider state
         self.provider_index = 0
         self.groq_client: Optional[Groq] = None
+
+        # v7.3 — properly initialize all instance state that was previously
+        # scattered as class vars or lazy getattr hacks.
+        self._sudo_password: Optional[str] = None
+        self._sudo_skip_session: bool = False
+        self._turn_no: int = 0          # boxed UI turn counter
+        self._prompt_turn: int = 0      # API call counter (for tools block gating)
+        self._pending_dispatch_error: Optional[str] = None
+        self._pending_dispatch_error_to_prompt: Optional[str] = None
+        self._no_cmd_retries: int = 0
 
         os.makedirs(INSTALL_DIR, exist_ok=True)
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -4563,13 +4539,6 @@ class AthenaSession:
                   f"'{cred_value[:24]}' against {len(untested)} services "
                   f"(node {fanout_id})\033[0m")
         self.cred_fanout_queue.clear()
-
-    # v7.1 — sudo password handling.  Prompted once via getpass at first
-    # sudo command; cached in memory; injected via `sudo -S` (read from
-    # stdin) for every sudo run.  This works regardless of TTY because
-    # we feed the password through subprocess pipes ourselves.
-    _sudo_password: Optional[str] = None
-    _sudo_skip_session: bool = False  # user opted out
 
     def _command_needs_sudo(self, cmd: str) -> bool:
         """Detect if a command starts with sudo or contains 'sudo ' as
@@ -5092,6 +5061,9 @@ class AthenaSession:
         agent_role = self._select_agent(active, free_form=prompt)
         self.current_agent = agent_role
 
+        # v7.3 — increment the prompt turn counter for tools-block gating
+        self._prompt_turn += 1
+
         # The NEED loop: build a minimal prompt; if the LLM emits [NEED],
         # rebuild with the requested attachments and call again, up to
         # MAX_NEED_FETCHES times.
@@ -5110,6 +5082,7 @@ class AthenaSession:
                 graph=self.graph,
                 scope=self.scope,
                 need_attachments=need_attachments,
+                turn_no=self._prompt_turn,
             )
 
             # v7.1 — slice history per context manager
@@ -5188,11 +5161,7 @@ class AthenaSession:
             self.history = self.history[-(MAX_HISTORY_MESSAGES * 2):]
         self._log(f"[AI:{agent_role}]\n{response}")
 
-        # v7.2 — TOOL dispatch: convert [TOOL]/[ARGS] → shell string.
-        # Hard errors are stashed on self._pending_dispatch_error so the
-        # agent loop can splice them into the next prompt — that way
-        # the LLM actually learns about its bad kwargs instead of
-        # looping the same args.
+        # v7.3 — TOOL dispatch: convert [TOOL]/[ARGS] → shell string.
         self._pending_dispatch_error = None
         dispatch_remap_note = ""
         if parsed["tool"]:
@@ -5223,7 +5192,7 @@ class AthenaSession:
         # ─── v7.2 BOXED RENDERING ──────────────────────────────────
         target_label = (self.target_info.get("ip") or
                         self.target_info.get("domain") or "no-target")
-        self._turn_no = getattr(self, "_turn_no", 0) + 1
+        self._turn_no += 1
         v_count = len(self.ptt.get_verified())
         u_count = len(self.ptt.get_unverified())
         node_label = active.nid if active else "—"
@@ -5358,11 +5327,9 @@ class AthenaSession:
             # think_turn(); no inline header needed here.
             active = self.ptt.find_in_progress() or self.ptt.find_next_pending()
 
-            # v7.2 — if a previous turn produced a hard dispatch error,
-            # splice it into the prompt so the LLM sees its own mistake
-            # and can correct.  Without this the loop just kept emitting
-            # the same kwargs and getting silently dropped.
-            pending_err = getattr(self, "_pending_dispatch_error_to_prompt", None)
+            # v7.3 — if a previous turn produced a hard dispatch error,
+            # splice it into the prompt so the LLM sees its own mistake.
+            pending_err = self._pending_dispatch_error_to_prompt
             if pending_err:
                 prompt = (
                     f"DISPATCH ERROR FROM YOUR PREVIOUS TURN:\n"
@@ -5378,9 +5345,9 @@ class AthenaSession:
             verify  = parsed["verify"]
             handoff = parsed["handoff"]
 
-            # v7.2 — propagate any fresh dispatch error from think_turn
+            # v7.3 — propagate any fresh dispatch error from think_turn
             # into the next iteration of this loop.
-            if getattr(self, "_pending_dispatch_error", None):
+            if self._pending_dispatch_error:
                 self._pending_dispatch_error_to_prompt = self._pending_dispatch_error
                 self._pending_dispatch_error = None
 
@@ -5388,9 +5355,8 @@ class AthenaSession:
                 # v7.1 — instead of bailing, retry up to 2x with a
                 # corrective hint.  This recovers from tool-dispatch
                 # failures and from the LLM accidentally omitting [CMD].
-                no_cmd_retries = getattr(self, "_no_cmd_retries", 0)
-                if no_cmd_retries < 2:
-                    self._no_cmd_retries = no_cmd_retries + 1
+                if self._no_cmd_retries < 2:
+                    self._no_cmd_retries += 1
                     say_warn("Agent did not output a [CMD] block — asking again.")
                     prompt = (
                         "Your previous response had no executable command. "
@@ -6246,17 +6212,15 @@ def _build_banner() -> str:
         L(f"    {W}██║  ██║   ██║   ██║  ██║███████╗██║ ╚████║██║  ██║{M}       ") + f"{M}│{R}",
         L(f"    {W}╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝{M}       ") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
-        L(f"   {B}{W}AI OFFENSIVE SECURITY AGENT{R}{M}  ·  {B}{C}v7.2{R}{M}                       ") + f"{M}│{R}",
+        L(f"   {B}{W}AI OFFENSIVE SECURITY AGENT{R}{M}  ·  {B}{C}v7.3{R}{M}                       ") + f"{M}│{R}",
         L(f"   {G}Bare-metal Kali NetHunter  ·  Commander: The Priest{M}            ") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
-        L(f" {G}╭─{C} v7.2 highlights {G}────────────────────────────────────────╮{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Tool Dispatch    {G}synonym-aware, errors fed to LLM{R}     {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Sudo Escalation  {G}auto-retry on permission denied{R}      {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Loop Breaker     {G}forced pivot on repeats{R}              {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Boxed UI         {G}every event in its own panel{R}         {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Per-Cmd Timeouts {G}long scans capped, no hangs{R}          {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ MITRE ATT&CK     {G}auto-tagged commands & findings{R}      {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Scope · Graph    {G}RoE enforced, networkx pivots{R}        {G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}╭─{C} v7.3 highlights {G}────────────────────────────────────────╮{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Token Savings    {G}tools block gated, KB trimmed{R}       {G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Provider Chain   {G}verified Groq models only{R}            {G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Instance Vars    {G}no more class-level state leaks{R}      {G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Output Compress  {G}tighter trim + more noise filters{R}    {G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ All v7.2 fixes   {G}tool dispatch, loop breaker, sudo{R}    {G}│{M}  ") + f"{M}│{R}",
         L(f" {G}╰───────────────────────────────────────────────────────────╯{M}  ") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
         L(f"   {G}type  {KB} help {R}{G}  for commands  ·  {KB} workflow {R}{G}  for menus{M}     ") + f"{M}│{R}",
