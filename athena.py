@@ -238,6 +238,7 @@ KWARG_SYNONYMS = {
         "hash":        "hash_file",
         "wordlist_path":"wordlist",
         "rule":        "rules",
+        "show_first":  "show_only",   # v7.3: renamed param
     },
     "nuclei": {
         "url":         "target",
@@ -1506,8 +1507,6 @@ class PTT:
                 if verified and not f.verified:
                     f.verified = True
                     f.source_cmd = source_cmd
-                if node_id not in [f.node_id]:
-                    pass  # keep first node that found it
                 return f.fid
         fid = self._next_finding_id
         self._next_finding_id += 1
@@ -2726,13 +2725,19 @@ class ToolBuilder:
     def hashcat(hash_file: str, mode: int,
                 wordlist: str = "/usr/share/wordlists/rockyou.txt",
                 rules: Optional[str] = None,
-                show_first: bool = True) -> str:
-        if show_first:
-            # cached hits returned instantly
+                show_only: bool = False) -> str:
+        """v7.3 BUG FIX: was show_first=True by default, which made the builder
+        ONLY run --show (cache check) and never actually crack unless the model
+        explicitly passed show_first=False.  Silent failure.
+        Now: use show_only=True explicitly if you only want a cache check,
+        otherwise it always runs the full crack."""
+        if show_only:
             return f"hashcat -m {mode} {hash_file} {wordlist} --show"
         cmd = f"hashcat -m {mode} {hash_file} {wordlist}"
         if rules:
             cmd += f" -r {rules}"
+        # Always attempt --show first then fall through to crack in one command
+        cmd += " --force"
         return cmd
 
     @staticmethod
@@ -3527,6 +3532,9 @@ class ContextManager:
         return max(1, len(text) // 4)
 
     def record_savings(self, full_size: int, sent_size: int):
+        """v7.3 FIX: was always full_size = sent_size + 4000 (constant 1000 token
+        'saving' every turn regardless of what was skipped).  Now actually
+        tracks the difference between estimated full context and what was sent."""
         if full_size > sent_size:
             self.tokens_saved_estimate += (full_size - sent_size) // 4
 
@@ -4423,6 +4431,15 @@ class AthenaSession:
             goal += f" — {notes}"
         self.ptt = PTT(goal=goal)
 
+        # v7.3 BUG FIX: also reset engagement-scoped state that was previously
+        # left stale across target changes, poisoning new engagements with old data.
+        self.graph = AttackGraph()
+        self.cred_fanout_queue.clear()
+        self.attack_techniques_used.clear()
+        # Reset turn counters so new target gets the tools block again (turns 1-2)
+        self._prompt_turn = 0
+        self._turn_no = 0
+
         if ip or domain:
             summary = " | ".join(filter(None, [ip, domain]))
             print(f"\n\033[32m   Target: {summary}\033[0m")
@@ -4864,15 +4881,20 @@ class AthenaSession:
                 say_sys("retrying with sudo prefix…", color="33")
                 return self.run_command("sudo " + cmd, label=label + "-SUDO")
 
-        # Auto-CVE lookup on recon-type commands
-        if any(kw in cmd for kw in ["nmap", "whatweb", "smbclient",
+        # v7.3 BUG FIX: auto_cve_lookup was firing on EVERY nmap/nikto/etc output,
+        # even when there were no CVEs or version strings worth searching.
+        # That meant up to 3 searchsploit subprocesses on every recon command —
+        # painfully slow on NetHunter.  Now gated: only run if the output actually
+        # contains a CVE reference OR at least one open port with a banner.
+        has_cve_ref = bool(re.search(r'CVE-\d{4}-\d+', raw_output, re.IGNORECASE))
+        has_port_banner = bool(re.search(r'\d+/tcp\s+open\s+\S+\s+\S', raw_output))
+        if (any(kw in cmd for kw in ["nmap", "whatweb", "smbclient",
                                       "nikto", "searchsploit", "nuclei",
-                                      "nxc ", "crackmapexec"]):
+                                      "nxc ", "crackmapexec"])
+                and (has_cve_ref or has_port_banner)):
             cve_extra = auto_cve_lookup(raw_output)
             if cve_extra:
                 print(cve_extra)
-                # Add to context, but DON'T parse this as findings
-                # (those CVEs already came from real output)
 
         # Auto-exploit suggestion when CVE found
         cve_matches = re.findall(r'CVE-\d{4}-\d+', raw_output, re.IGNORECASE)
@@ -4954,9 +4976,15 @@ class AthenaSession:
             color="31"))
 
         result = self.run_command(verify_cmd, label="VERIFY")
-        if result in (EXEC_REJECTED, EXEC_DESTRUCTIVE,
-                      EXEC_INTERACTIVE_BLOCKED, EXEC_SESSION_EXIT):
-            return result == EXEC_SESSION_EXIT and False or False
+        if result == EXEC_SESSION_EXIT:
+            # Propagate session exit — was silently dropped before (always-False bug)
+            say_athena("Session ended during verification.")
+            self._generate_report()
+            if self.logfile:
+                self.logfile.close()
+            sys.exit(0)
+        if result in (EXEC_REJECTED, EXEC_DESTRUCTIVE, EXEC_INTERACTIVE_BLOCKED):
+            return False
 
         # Heuristic: verify command output should NOT contain auth-failure
         # markers and SHOULD be non-empty.
@@ -5122,12 +5150,14 @@ class AthenaSession:
             messages.extend(compressed_history)
             messages.append({"role": "user", "content": prompt})
 
-            # Estimate tokens for context savings counter
+            # Track token savings: estimate what full context would have been
+            # (tools block ~2800 + extra KB sections ~1600) vs what was sent.
             sent_size = sum(len(m["content"]) for m in messages)
-            full_size_est = sent_size + (
-                # estimate of what FULL context would have added
-                4000 if not need_attachments else 0
-            )
+            tools_skipped = (self._prompt_turn > TOOLS_BLOCK_TURNS
+                             and "tools" not in need_attachments)
+            full_size_est = sent_size
+            if tools_skipped:
+                full_size_est += 2800   # kali_tool_summary + tool_registry
             self.context_mgr.record_savings(full_size_est, sent_size)
 
             response = self._think_with_fallback(messages,
@@ -5340,6 +5370,11 @@ class AthenaSession:
                 self._pending_dispatch_error_to_prompt = None
 
             parsed = self.think_turn(prompt, workflow_key=workflow_key)
+            # v7.3 BUG FIX: re-query active AFTER think_turn, which may have
+            # changed node statuses (todo→in_progress).  Using the pre-think_turn
+            # snapshot caused attempt tracking and dead-end marking to hit the
+            # wrong (stale) node.
+            active = self.ptt.find_in_progress() or self.ptt.find_next_pending()
             cmd     = parsed["cmd"]
             conf    = parsed["conf"]
             verify  = parsed["verify"]
@@ -5605,26 +5640,13 @@ class AthenaSession:
                     # Just run the verify command standalone
                     self.run_command(verify, label="VERIFY")
 
-            # Build pivot prompt with fresh context
-            pivot_lines = []
-            f_dict = self.ptt.findings_by_type_dict(only_verified=True)
-            if f_dict:
-                pivot_lines.append("VERIFIED FINDINGS:")
-                for k, vs in f_dict.items():
-                    pivot_lines.append(f"  {k.upper()}: {', '.join(vs[-4:])}")
-            unv = self.ptt.get_unverified()
-            if unv:
-                u_dict: Dict[str, List[str]] = {}
-                for f in unv[-15:]:
-                    u_dict.setdefault(f.ftype, []).append(f.value)
-                pivot_lines.append("UNVERIFIED CANDIDATES:")
-                for k, vs in u_dict.items():
-                    pivot_lines.append(f"  {k.upper()}: {', '.join(vs)}")
-            pivot = "\n".join(pivot_lines)
-
+            # Build pivot prompt — v7.3 BUG FIX: removed the full findings
+            # embed that was in every user message.  Findings are already in
+            # the system prompt (findings_block).  Doubling them here added
+            # ~500 chars to every history message and inflated context 3× over
+            # a DEFAULT_HISTORY_SLICE=3 window.
             prompt = (
                 f"TERMINAL OUTPUT:\n{output}\n\n"
-                f"{pivot}\n\n"
                 "Analyse with elite reasoning in [THOUGHT].  Pivot on "
                 "verified findings.  WORKFLOW_COMPLETE if current node "
                 "is done; else next [CMD].  Always include [CONF]."
@@ -6170,6 +6192,12 @@ class AthenaSession:
                 # v7.1 — wipe in-memory sudo password on reset
                 self._sudo_password = None
                 self._sudo_skip_session = False
+                # v7.3 BUG FIX: reset turn counters so tools block reappears
+                self._prompt_turn = 0
+                self._turn_no = 0
+                self._pending_dispatch_error = None
+                self._pending_dispatch_error_to_prompt = None
+                self._no_cmd_retries = 0
                 say_athena("Full reset.  Fresh PTT, graph, sudo cache wiped, "
                            "no findings, no history.")
             elif cmd == "scope":
