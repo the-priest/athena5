@@ -68,6 +68,41 @@ writes it to `~/.bashrc` and `~/.zshrc`.
 
 ---
 
+## What's in v7.4 — Basilisk brain transplant
+
+v7.4 ports the self-contained "smart" subsystems from Basilisk into Athena as
+a new `athena_ext/` package. Everything is stdlib-only, imported lazily and
+**fail-soft** — a missing or broken module just disables that feature, it never
+stops Athena from booting. Check load state any time with `ext` or `tools`.
+
+| Subsystem | What Athena gains |
+|-----------|-------------------|
+| **memory** | Persistent **cross-session recall** (SQLite at `~/.athena/memory.db`). Relevant past facts/findings/prefs are auto-recalled into the prompt each turn and auto-captured after it. Query it yourself with `memory <query>`. FTS5 keyword recall; no embeddings backend required. |
+| **oracle** | **Verified exploitation.** Arm an attempt with an explicit success criterion *before* running it, then check real output against it → `confirmed` / `failed` / `inconclusive`. Includes an out-of-band canary listener for blind/OOB bugs. A finding is only "verified" once the oracle confirms it. |
+| **zdayfind** | **Variant-analysis source scanner** (Project-Zero style). 31 signatures for zero-day *classes* (RCE / deser / SSTI / SQLi / SSRF / traversal / XXE / proto-pollution / weak-crypto / JWT-noverify / …) across py·js·ts·php·java·ruby·go·.net. `zday <path>`. |
+| **codescan** | **SAST / SCA / secrets** orchestration — detects the stack and emits a scan plan (semgrep · bandit · gitleaks · osv · trivy · pip-audit · npm-audit · nuclei …) with install hints, and parses their JSON back to normalized findings. `codescan <path>`. |
+| **headroom** | Smarter output compression — keeps signal lines (IPs, ports, CVEs, creds, hashes) and drops runs of noise instead of a blind head/tail slice. Directly cuts Groq token burn. |
+| **foresight** | **Destructive-op risk assessment** — blast-radius + reversibility verdict and an undo hint shown *before* the y/n gate, on top of Athena's existing hard destructive/scope refusals. |
+| **sandbox** | bubblewrap isolation primitive + capability report (foundation for future sandboxed skill execution). |
+
+The model reaches these through the same `[TOOL]name[/TOOL][ARGS]json[/ARGS]`
+syntax as the shell tools, but they run **in-process** (no shell, no y/n gate —
+they're read-only / local-state only): `zday_scan`, `zday_signatures`,
+`codescan_plan`, `codescan_tooling`, `memory_recall`, `memory_remember`,
+`memory_forget`, `oracle_arm`, `oracle_check`, `oracle_status`, `oob_start`,
+`oob_hits`.
+
+### Deliberately *not* ported (yet)
+
+`pentest.py` (collides with Athena's own ToolBuilder + finding pipeline),
+`mcp.py` (needs a full client + connector config), `skills.py` (executes
+model-written code — opt into that on purpose, not by default), and Basilisk's
+persona / Unleash / bench / reach layers (GUI-specific, duplicate Athena, or —
+`reach` — were deliberately unwired in Basilisk to close an indirect
+prompt-injection surface, so they're not reopened here).
+
+---
+
 ## What's in v7.3 — Token savings + bug fixes
 
 ### Token savings (~1200 tokens saved per turn after turn 2)
@@ -149,6 +184,11 @@ native GTK4 / libadwaita GUI shell.
 | `model`    | Provider chain status |
 | `agent`    | List all specialist agents |
 | `dashboard`| Concise session status panel |
+| `memory`   | Persistent recall — `memory <query>` to search stored facts |
+| `oracle`   | Verified-exploitation ledger for the current target |
+| `zday`     | `zday <path>` — variant-analysis source scan (31 zero-day-class sigs) |
+| `codescan` | `codescan <path>` — SAST/SCA/secrets scan plan for a codebase |
+| `ext`      | Show which smart subsystems (`athena_ext/`) loaded |
 | `save`     | Save conversation to file |
 | `report`   | Generate the engagement report now |
 | `clear`    | Clear AI memory (PTT preserved) |

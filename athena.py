@@ -29,7 +29,16 @@ import subprocess
 import ipaddress
 import shutil
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple, Set
+
+# v7.4 — make the athena_ext package importable no matter how we're launched.
+# The CLI is symlinked into /usr/local/bin, so the interpreter's default
+# sys.path[0] can be the symlink dir (no athena_ext there).  Resolve the real
+# location of THIS file and put its directory on the path first.
+_SELF_DIR = os.path.dirname(os.path.realpath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.insert(0, _SELF_DIR)
 
 try:
     from groq import Groq
@@ -55,7 +64,7 @@ except ImportError:
 # VERSION & PROVIDER CHAIN  (Groq only, biggest→smallest)
 # ═════════════════════════════════════════════════════════════════════
 
-VERSION = "7.3"
+VERSION = "7.4"
 
 # v7.3 — CHEAP-FIRST chain, verified Groq models only.
 # openai/gpt-oss-* and allam-2-7b were 404-ing constantly and burning
@@ -81,6 +90,43 @@ INSTALL_DIR = os.path.expanduser("~/.athena")
 LOG_DIR     = os.path.join(INSTALL_DIR, "logs")
 SCOPE_FILE  = os.path.join(INSTALL_DIR, "scope.json")
 BOOT_LOCK   = "/tmp/athena_session.lock"
+MEMORY_DB   = os.path.join(INSTALL_DIR, "memory.db")     # v7.4 — persistent recall
+ORACLE_DIR  = os.path.join(INSTALL_DIR, "oracle")        # v7.4 — verified-exploit ledger
+
+# ── v7.4 — "smart" subsystems ported from Basilisk (athena_ext/) ──────
+# Imported lazily and fail-soft: a missing or broken ext module must never
+# stop the agent from booting.  _ext("memory") returns the module or None.
+_EXT_CACHE: Dict[str, Any] = {}
+_EXT_FAILED: Dict[str, str] = {}
+
+def _ext(name: str):
+    """Lazy import of an athena_ext submodule; returns the module or None.
+    Caches both successes and failures so a broken optional module is only
+    warned about once."""
+    if name in _EXT_CACHE:
+        return _EXT_CACHE[name]
+    if name in _EXT_FAILED:
+        return None
+    try:
+        mod = __import__(f"athena_ext.{name}", fromlist=[name])
+        _EXT_CACHE[name] = mod
+        return mod
+    except Exception as e:                       # pragma: no cover - env-dependent
+        _EXT_FAILED[name] = str(e)
+        return None
+
+def ext_status() -> Dict[str, str]:
+    """Report which smart modules loaded, for the `tools`/dashboard views."""
+    out = {}
+    for n in ("memory", "oracle", "zdayfind", "codescan",
+              "headroom", "foresight", "sandbox"):
+        if n in _EXT_CACHE:
+            out[n] = "loaded"
+        elif n in _EXT_FAILED:
+            out[n] = f"failed: {_EXT_FAILED[n][:40]}"
+        else:
+            out[n] = "not-yet-loaded"
+    return out
 
 # v7.3 — smart context: keep more in memory, send less by default
 MAX_HISTORY_MESSAGES   = 32   # how many turns kept in RAM
@@ -1976,11 +2022,33 @@ def compress_output_for_history(output: str,
         last = line
 
     result = '\n'.join(cleaned).strip()
-    # v7.3: tighter cap — 1600 chars max (was 1800), head+tail split
+    # v7.4 — smarter overflow handling: hand the block to headroom, which
+    # keeps signal lines (IPs, ports, CVEs, creds, hashes) and drops runs of
+    # noise, instead of a blind head/tail slice.  Falls back to the v7.3
+    # head/tail if the ext isn't present or errors.
     if len(result) > 1600:
-        head = result[:650]
-        tail = result[-500:]
-        result = f"{head}\n[...{len(result)-1150} chars trimmed...]\n{tail}"
+        hr_mod = _ext("headroom")
+        compressed = None
+        if hr_mod is not None:
+            try:
+                msgs = [{"role": "user",
+                         "content": f"<tool_result>\n{result}\n</tool_result>"}]
+                out, stats = hr_mod.compress_messages(
+                    msgs, {"headroom_enabled": True,
+                           "headroom_min_chars": 800,
+                           "headroom_keep_recent": 0,
+                           "headroom_target_ratio": 0.4})
+                if stats.get("enabled") and out and out[0].get("content"):
+                    compressed = re.sub(
+                        r"</?tool_result>\n?", "", out[0]["content"]).strip()
+            except Exception:
+                compressed = None
+        if compressed and len(compressed) < len(result):
+            result = compressed
+        else:
+            head = result[:650]
+            tail = result[-500:]
+            result = f"{head}\n[...{len(result)-1150} chars trimmed...]\n{tail}"
     return result or "(no useful output)"
 
 
@@ -3050,6 +3118,171 @@ def dispatch_tool(name: str, args_json: str) -> Tuple[Optional[str], Optional[st
     return (shell_str, None)
 
 
+# ═════════════════════════════════════════════════════════════════════
+# v7.4 — PURE (in-process) TOOLS  ·  ported from Basilisk (athena_ext/)
+# ═════════════════════════════════════════════════════════════════════
+# Unlike the TOOL_DISPATCH builders (which emit a shell string that
+# run_command() then executes behind the y/n gate), these run *inside*
+# Athena and return text directly.  They never touch a shell, never leave
+# the box (oracle's canary binds a LAN socket only), and are read-only or
+# local-state-only — so they bypass the confirmation gate.  They're
+# intercepted in think_turn() before shell dispatch.
+#
+# Signature contract: fn(session, args: dict) -> str   (str fed back to LLM)
+
+def _pt_zday_scan(session, a):
+    z = _ext("zdayfind")
+    if z is None:
+        return "zdayfind module unavailable."
+    focus = a.get("focus")
+    if isinstance(focus, str):
+        focus = [x.strip() for x in focus.split(",") if x.strip()]
+    r = z.zday_scan(path=a.get("path", ""), code=a.get("code", ""),
+                    like=a.get("like", ""), focus=focus)
+    return json.dumps(r, indent=2)[:MAX_OUTPUT_CHARS]
+
+def _pt_zday_signatures(session, a):
+    z = _ext("zdayfind")
+    if z is None:
+        return "zdayfind module unavailable."
+    return json.dumps(z.signature_catalog(), indent=2)[:MAX_OUTPUT_CHARS]
+
+def _pt_codescan_plan(session, a):
+    c = _ext("codescan")
+    if c is None:
+        return "codescan module unavailable."
+    r = c.scan_plan(path=a.get("path", "."), kind=a.get("kind", "auto"))
+    return json.dumps(r, indent=2)[:MAX_OUTPUT_CHARS]
+
+def _pt_codescan_tooling(session, a):
+    c = _ext("codescan")
+    if c is None:
+        return "codescan module unavailable."
+    return json.dumps(c.code_tooling_check(), indent=2)[:MAX_OUTPUT_CHARS]
+
+def _pt_memory_recall(session, a):
+    if not getattr(session, "mem", None):
+        return "memory subsystem unavailable."
+    return session.mem.tool_recall(a.get("query", ""), k=int(a.get("k", 8)))
+
+def _pt_memory_remember(session, a):
+    if not getattr(session, "mem", None):
+        return "memory subsystem unavailable."
+    return session.mem.tool_remember(
+        a.get("text", ""), a.get("kind", "fact"),
+        float(a.get("salience", 0.6)))
+
+def _pt_memory_forget(session, a):
+    if not getattr(session, "mem", None):
+        return "memory subsystem unavailable."
+    return session.mem.tool_forget(a.get("query", ""))
+
+def _pt_oracle_arm(session, a):
+    o = _ext("oracle")
+    if o is None:
+        return "oracle module unavailable."
+    r = o.arm(engagement=session._oracle_engagement(),
+              objective=a.get("objective", ""), target=a.get("target", ""),
+              technique=a.get("technique", ""),
+              criterion_type=a.get("criterion_type", "contains"),
+              criterion_value=a.get("criterion_value", ""),
+              blind=bool(a.get("blind", False)),
+              base_dir=session._oracle_base())
+    return json.dumps(r, indent=2)
+
+def _pt_oracle_check(session, a):
+    o = _ext("oracle")
+    if o is None:
+        return "oracle module unavailable."
+    r = o.check(engagement=session._oracle_engagement(),
+                attempt_id=a.get("attempt_id", ""),
+                evidence=a.get("evidence", ""),
+                status=a.get("status"),
+                base_dir=session._oracle_base())
+    return json.dumps(r, indent=2)
+
+def _pt_oracle_status(session, a):
+    o = _ext("oracle")
+    if o is None:
+        return "oracle module unavailable."
+    r = o.status(engagement=session._oracle_engagement(),
+                 base_dir=session._oracle_base())
+    return json.dumps(r, indent=2)
+
+def _pt_oob_start(session, a):
+    o = _ext("oracle")
+    if o is None:
+        return "oracle module unavailable."
+    return json.dumps(o.oob_start(), indent=2)
+
+def _pt_oob_hits(session, a):
+    o = _ext("oracle")
+    if o is None:
+        return "oracle module unavailable."
+    return json.dumps(o.oob_hits(a.get("token", "")), indent=2)[:MAX_OUTPUT_CHARS]
+
+
+PURE_TOOL_DISPATCH = {
+    "zday_scan":         _pt_zday_scan,
+    "zday_signatures":   _pt_zday_signatures,
+    "codescan_plan":     _pt_codescan_plan,
+    "codescan_tooling":  _pt_codescan_tooling,
+    "memory_recall":     _pt_memory_recall,
+    "memory_remember":   _pt_memory_remember,
+    "memory_forget":     _pt_memory_forget,
+    "oracle_arm":        _pt_oracle_arm,
+    "oracle_check":      _pt_oracle_check,
+    "oracle_status":     _pt_oracle_status,
+    "oob_start":         _pt_oob_start,
+    "oob_hits":          _pt_oob_hits,
+}
+
+# Compact spec shown to the model (gated to turns 1-2 like the shell registry).
+PURE_TOOL_SPEC = (
+    "IN-PROCESS TOOLS (same [TOOL]name[/TOOL][ARGS]json[/ARGS] syntax; these "
+    "run instantly inside Athena, no shell, no y/n gate — read-only/analysis):\n"
+    "  zday_scan[ARGS]{\"path\":\"./src\"}[/ARGS] or {\"code\":\"...\"} or "
+    "{\"like\":\"os.system(x)\"} [+\"focus\":\"rce,sqli\"] — variant-analysis "
+    "source scan (31 zero-day-class sink signatures across py/js/ts/php/java/"
+    "ruby/go/.net); ranks worst-first, low false positives.\n"
+    "  zday_signatures — list the signature catalog.\n"
+    "  codescan_plan[ARGS]{\"path\":\".\"}[/ARGS] — detect stack + emit a SAST/"
+    "SCA/secrets scan plan (semgrep/bandit/gitleaks/osv/trivy/…) with install "
+    "hints; codescan_tooling — which scanners are installed.\n"
+    "  memory_recall[ARGS]{\"query\":\"...\"}[/ARGS] — search persistent cross-"
+    "session memory; memory_remember[ARGS]{\"text\":\"...\",\"kind\":\"finding|"
+    "pref|fact\"}[/ARGS]; memory_forget[ARGS]{\"query\":\"...\"}[/ARGS].\n"
+    "  oracle_arm[ARGS]{\"objective\":\"...\",\"target\":\"...\",\"criterion_"
+    "type\":\"contains|absent|status|regex|differential|oob\",\"criterion_"
+    "value\":\"...\"}[/ARGS] — register an exploit attempt + success test BEFORE "
+    "you run it; returns an attempt id (and a canary URL if blind/oob).\n"
+    "  oracle_check[ARGS]{\"attempt_id\":\"...\",\"evidence\":\"<cmd output>\"}"
+    "[/ARGS] — judge that evidence against the armed criterion → confirmed/"
+    "failed/inconclusive. A finding is VERIFIED only once the oracle confirms.\n"
+    "  oracle_status — armed/confirmed ledger; oob_start — start the out-of-"
+    "band canary listener; oob_hits[ARGS]{\"token\":\"...\"}[/ARGS] — callbacks.\n"
+    "Discipline: arm -> exploit -> check. Don't claim success the oracle "
+    "hasn't confirmed."
+)
+
+
+def run_pure_tool(session, name: str, args_json: str) -> Tuple[Optional[str], Optional[str]]:
+    """Execute an in-process tool. Returns (result_text, error_text)."""
+    fn = PURE_TOOL_DISPATCH.get(name)
+    if fn is None:
+        return (None, f"unknown in-process tool {name!r}")
+    try:
+        args = json.loads(args_json) if args_json and args_json.strip() else {}
+    except json.JSONDecodeError as e:
+        return (None, f"bad JSON in [ARGS] for {name}: {e}")
+    if not isinstance(args, dict):
+        return (None, f"[ARGS] for {name} must be a JSON object")
+    try:
+        return (fn(session, args), None)
+    except Exception as e:
+        return (None, f"{name} error: {e}")
+
+
 def tool_registry_for_prompt() -> str:
     """Compact registry summary so the LLM knows what's available
     structured.  Inspects each builder's signature to surface the
@@ -3924,7 +4157,8 @@ def build_system_prompt(agent_role: str,
                         scope: Optional["ScopeConfig"] = None,
                         force_full: bool = False,
                         need_attachments: Optional[List[str]] = None,
-                        turn_no: int = 0) -> str:
+                        turn_no: int = 0,
+                        memory_block: str = "") -> str:
     """Compose system prompt for the chosen specialist agent.
 
     v7.3 — token-saving improvements:
@@ -4076,6 +4310,17 @@ def build_system_prompt(agent_role: str,
     # Structured tool registry — same gate as tools_block (~2200 chars saved/turn)
     structured_block = tool_registry_for_prompt() if include_tools else ""
 
+    # v7.4 — in-process (pure) tools + memory instruction, same first-N-turns
+    # gate.  memory_block (the actual recalled facts) is passed per-turn by
+    # think_turn and is ALWAYS included when non-empty — recall is the point.
+    pure_block = PURE_TOOL_SPEC if include_tools else ""
+    mem_instr = ""
+    if _ext("memory") is not None and (include_tools or "memory" in need_attachments):
+        try:
+            mem_instr = _ext("memory").PROMPT_BLOCK
+        except Exception:
+            mem_instr = ""
+
     # Scope reminder
     scope_block = ""
     if scope and scope.enabled:
@@ -4111,8 +4356,14 @@ def build_system_prompt(agent_role: str,
         parts.append(graph_block)
     if structured_block:
         parts.append(structured_block)
+    if pure_block:
+        parts.append(pure_block)
     if tools_block:
         parts.append(tools_block)
+    if mem_instr:
+        parts.append(mem_instr)
+    if memory_block:
+        parts.append("Recalled memory (things you already know):\n" + memory_block)
     parts.append("KNOWLEDGE BASE:\n" + kb_text)
     parts.append(CORE_RULES)
     return "\n\n".join(parts)
@@ -4213,6 +4464,19 @@ class AthenaSession:
         self.graph = AttackGraph()
         self.context_mgr = ContextManager()
 
+        # v7.4 — persistent cross-session memory (Basilisk port).  Fail-soft:
+        # if the module or sqlite is unavailable, self.mem stays None and every
+        # memory call is a no-op — the agent still runs, just without recall.
+        self.mem = None
+        _mem = _ext("memory")
+        if _mem is not None:
+            try:
+                os.makedirs(INSTALL_DIR, exist_ok=True)
+                self.mem = _mem.MemoryStore(Path(MEMORY_DB))
+            except Exception as e:
+                say_warn(f"memory disabled: {e}")
+                self.mem = None
+
         # v7.1 — credential fanout queue (creds awaiting service tests)
         self.cred_fanout_queue: List[Tuple[str, str]] = []  # (cred_value, user)
 
@@ -4243,6 +4507,21 @@ class AthenaSession:
         ensure_rockyou()
 
     # ── Provider init ─────────────────────────────────────────────
+
+    # ── v7.4 — oracle (verified-exploitation) helpers ─────────────
+    def _oracle_base(self) -> Path:
+        p = Path(ORACLE_DIR)
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return p
+
+    def _oracle_engagement(self) -> str:
+        """One ledger per target so armed attempts don't cross engagements."""
+        tgt = (self.target_info.get("ip")
+               or self.target_info.get("domain") or "default")
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", str(tgt)) or "default"
 
     def _init_provider(self):
         groq_key = os.environ.get("GROQ_API_KEY")
@@ -4693,6 +4972,22 @@ class AthenaSession:
             self._log(f"[INTERACTIVE BLOCKED] {cmd}")
             return EXEC_INTERACTIVE_BLOCKED
 
+        # v7.4 — foresight advisory: assess blast radius + reversibility and
+        # surface an undo hint BEFORE the y/n gate.  Advisory only — Athena's
+        # _is_destructive / scope / interactive hard checks already ran above;
+        # this just gives the operator (and the log) a heads-up on caution/block
+        # verdicts.  Fail-soft: any error and we skip the card.
+        _fs = _ext("foresight")
+        if _fs is not None:
+            try:
+                verdict = _fs.assess(cmd, kind="shell")
+                if verdict.get("verdict") in ("caution", "block"):
+                    print()
+                    print(_fs.render_card(verdict))
+                    self._log(f"[FORESIGHT {verdict.get('verdict')}] {cmd}")
+            except Exception:
+                pass
+
         # v7.1 — MITRE ATT&CK pre-tag for the command itself
         attack_tag = attack_id_for_command(cmd)
         attack_label = ""
@@ -5098,6 +5393,23 @@ class AthenaSession:
         need_attachments: List[str] = []
         parsed: Dict[str, Any] = {}
         for fetch_round in range(MAX_NEED_FETCHES + 1):
+            # v7.4 — pull relevant persistent memories for this turn and inject
+            # them into the prompt.  Query = target + current objective so recall
+            # is scoped, not a firehose.  Silent + fail-soft.
+            memory_block = ""
+            if self.mem:
+                try:
+                    q = " ".join(x for x in (
+                        self.target_info.get("ip", ""),
+                        self.target_info.get("domain", ""),
+                        self.target_info.get("notes", ""),
+                        prompt) if x)[:400]
+                    rows = self.mem.recall(q, k=6)
+                    if rows:
+                        memory_block = self.mem.format_block(rows)
+                except Exception:
+                    memory_block = ""
+
             sys_prompt = build_system_prompt(
                 agent_role=agent_role,
                 target_info=self.target_info,
@@ -5111,6 +5423,7 @@ class AthenaSession:
                 scope=self.scope,
                 need_attachments=need_attachments,
                 turn_no=self._prompt_turn,
+                memory_block=memory_block,
             )
 
             # v7.1 — slice history per context manager
@@ -5191,8 +5504,43 @@ class AthenaSession:
             self.history = self.history[-(MAX_HISTORY_MESSAGES * 2):]
         self._log(f"[AI:{agent_role}]\n{response}")
 
-        # v7.3 — TOOL dispatch: convert [TOOL]/[ARGS] → shell string.
+        # v7.4 — IN-PROCESS (pure) tool interception.  Runs entirely inside
+        # Athena (analysis/memory/oracle), returns text straight back into
+        # context, and skips the shell + y/n gate.  Handled here so the
+        # normal shell-dispatch path below never sees it.
         self._pending_dispatch_error = None
+        dispatch_remap_note = ""
+        parsed["pure_result"] = None
+        if parsed["tool"] in PURE_TOOL_DISPATCH:
+            result, err = run_pure_tool(self, parsed["tool"], parsed["args"] or "{}")
+            if err:
+                self._pending_dispatch_error = (
+                    f"Your [TOOL]{parsed['tool']}[/TOOL] (in-process) call "
+                    f"failed:\n  {err}\nCorrect the args or switch tools.")
+                parsed["pure_result"] = f"ERROR: {err}"
+            else:
+                parsed["pure_result"] = result
+            # Feed the result back as the next-turn context.
+            self.history.append({
+                "role": "user",
+                "content": f"[RESULT {parsed['tool']}]\n{parsed['pure_result']}"})
+            self._log(f"[PURE:{parsed['tool']}]\n{parsed['pure_result']}")
+            parsed["cmd"] = None
+            # Render + memory-capture happen in the shared tail below.
+            if parsed["thought"]:
+                print(thought_card(parsed["thought"], agent_role=agent_role))
+            print(panel(f"IN-PROCESS · {parsed['tool']}",
+                        (parsed["pure_result"] or "").splitlines()[:24] or ["(empty)"],
+                        color="36"))
+            self._turn_no += 1
+            if self.mem:
+                try:
+                    self.mem.observe_turn(prompt, response)
+                except Exception:
+                    pass
+            return parsed
+
+        # v7.3 — TOOL dispatch: convert [TOOL]/[ARGS] → shell string.
         dispatch_remap_note = ""
         if parsed["tool"]:
             shell, msg = dispatch_tool(parsed["tool"], parsed["args"] or "{}")
@@ -5265,6 +5613,15 @@ class AthenaSession:
 
         # v7.1 — feed signals back to context manager
         self.context_mgr.signal_confidence(parsed["conf"])
+
+        # v7.4 — persist the turn to cross-session memory (heuristic capture:
+        # facts/prefs/findings the operator or the model surfaced).  No-op if
+        # memory is disabled; never allowed to break a turn.
+        if self.mem:
+            try:
+                self.mem.observe_turn(prompt, response)
+            except Exception:
+                pass
 
         return parsed
 
@@ -5385,6 +5742,23 @@ class AthenaSession:
             if self._pending_dispatch_error:
                 self._pending_dispatch_error_to_prompt = self._pending_dispatch_error
                 self._pending_dispatch_error = None
+
+            # v7.4 — an in-process (pure) tool ran: its result is already in
+            # history.  That's a productive turn, NOT a missing-command failure,
+            # so reset the no-cmd counter and prompt the model to act on it.
+            if parsed.get("pure_result") is not None and cmd is None:
+                self._no_cmd_retries = 0
+                if self._pending_dispatch_error_to_prompt:
+                    # in-process call errored — let the standard error splice
+                    # (top of loop) feed it back next turn.
+                    prompt = "Fix the failed in-process call, or proceed."
+                else:
+                    prompt = (
+                        "The in-process tool result above is now in your context. "
+                        "Continue the objective: act on it with a [CMD]/[TOOL], "
+                        "record a finding, arm/check the oracle, or emit "
+                        "WORKFLOW_COMPLETE if the node's goal is met.")
+                continue
 
             if cmd is None:
                 # v7.1 — instead of bailing, retry up to 2x with a
@@ -5931,6 +6305,18 @@ class AthenaSession:
 
     def show_tools_status(self):
         print(f"\n{header_box('  KALI ARSENAL — AVAILABILITY  ', color='35')}\n")
+        # v7.4 — smart subsystem status up top.
+        for n in ("memory", "oracle", "zdayfind", "codescan",
+                  "headroom", "foresight", "sandbox"):
+            _ext(n)
+        smart = ext_status()
+        loaded = [k for k, v in smart.items() if v == "loaded"]
+        print(f"   \033[97mSMART (athena_ext)\033[0m  "
+              f"\033[32m{len(loaded)}\033[0m / \033[97m{len(smart)}\033[0m loaded")
+        print(f"     \033[36m▸\033[0m {', '.join(loaded) if loaded else '(none)'}")
+        broken = [f"{k} ({v})" for k, v in smart.items() if v.startswith("failed")]
+        if broken:
+            print(f"     \033[31m✗\033[0m {', '.join(broken)}")
         all_tools = all_kali_tools_flat()
         # Cache lookups
         for t in all_tools:
@@ -6073,7 +6459,9 @@ class AthenaSession:
             f"   Tools      : \033[97m{len(all_kali_tools_flat())}\033[0m  registered, "
             f"\033[97m{len(TOOL_DISPATCH)}\033[0m structured\n"
             f"   Scope RoE  : \033[97m{'enabled' if self.scope.enabled else 'disabled'}\033[0m\n"
-            f"   Graph      : \033[97m{'on' if HAS_NETWORKX else 'off (pip install networkx)'}\033[0m\n\n"
+            f"   Graph      : \033[97m{'on' if HAS_NETWORKX else 'off (pip install networkx)'}\033[0m\n"
+            f"   Smart ext  : \033[97m{sum(1 for v in ext_status().values() if v=='loaded')}\033[0m/7 loaded "
+            f"\033[90m(memory·oracle·zday·codescan·headroom·foresight·sandbox)\033[0m\n\n"
             "   \033[97mworkflow\033[0m  open the workflow menu\n"
             "   \033[97mtarget\033[0m    set or update target\n"
             "   \033[97mfindings\033[0m  show extracted findings (verified + unverified)\n"
@@ -6084,6 +6472,11 @@ class AthenaSession:
             "   \033[97mtools\033[0m     show tool availability + auto-install missing\n"
             "   \033[97mmodel\033[0m     show provider chain status\n"
             "   \033[97magent\033[0m     show all agent specialists\n"
+            "   \033[96mmemory\033[0m    persistent recall — 'memory <query>' to search\n"
+            "   \033[96moracle\033[0m    verified-exploitation ledger for this target\n"
+            "   \033[96mzday\033[0m      'zday <path>' — variant-analysis source scan\n"
+            "   \033[96mcodescan\033[0m  'codescan <path>' — SAST/SCA/secrets plan\n"
+            "   \033[96mext\033[0m       smart-subsystem load status\n"
             "   \033[97msave\033[0m      save conversation to file\n"
             "   \033[97mreport\033[0m    generate report now\n"
             "   \033[97mclear\033[0m     clear AI memory (PTT preserved)\n"
@@ -6101,6 +6494,121 @@ class AthenaSession:
         print()
 
     # ── REPL ──────────────────────────────────────────────────────
+
+    def show_ext_status(self):
+        """`ext` — show which ported smart modules loaded."""
+        # Touch each so status reflects reality, not lazy-load state.
+        for n in ("memory", "oracle", "zdayfind", "codescan",
+                  "headroom", "foresight", "sandbox"):
+            _ext(n)
+        lines = []
+        for name, state in ext_status().items():
+            mark = "✓" if state == "loaded" else "✗"
+            col = "32" if state == "loaded" else "31"
+            lines.append(f"  \033[{col}m{mark}\033[0m {name:<10} {state}")
+        print(panel("SMART SUBSYSTEMS (athena_ext)", lines, color="36"))
+
+    def show_memory(self, user_input: str):
+        """`memory [query]` — stats, or recall against a query."""
+        if not self.mem:
+            say_warn("Persistent memory is unavailable (module or sqlite missing).")
+            return
+        parts = user_input.split(None, 1)
+        if len(parts) > 1 and parts[1].strip():
+            q = parts[1].strip()
+            rows = self.mem.recall(q, k=8)
+            if not rows:
+                say_athena(f"No memories matched '{q}'.")
+                return
+            print(panel(f"MEMORY RECALL · '{q[:40]}'",
+                        self.mem.format_block(rows).splitlines()[:30], color="36"))
+        else:
+            st = self.mem.stats()
+            lines = [
+                f"  stored memories : {st.get('count', 0)}",
+                f"  keyword index   : {'FTS5' if st.get('fts') else 'LIKE-scan'}",
+                f"  vector recall   : {'on' if st.get('vector') else 'off (keyword only)'}",
+                f"  db              : {MEMORY_DB}",
+                "",
+                "  memory <query>          recall matching facts",
+                "  (the agent also stores/recalls automatically each turn)",
+            ]
+            print(panel("PERSISTENT MEMORY", lines, color="36"))
+
+    def show_oracle(self):
+        """`oracle` — verified-exploitation ledger for the current target."""
+        o = _ext("oracle")
+        if o is None:
+            say_warn("Oracle module unavailable.")
+            return
+        try:
+            st = o.status(engagement=self._oracle_engagement(),
+                          base_dir=self._oracle_base())
+        except Exception as e:
+            say_warn(f"oracle status failed: {e}")
+            return
+        counts = st.get("counts") or {}
+        lines = [f"  engagement : {st.get('engagement', '—')}",
+                 f"  {st.get('summary', '')}"]
+        oob = st.get("oob") or {}
+        if oob.get("listening"):
+            lines.append(f"  canary     : {oob.get('base_url','?')} "
+                         f"({oob.get('callbacks',0)} callbacks)")
+        rows = ((st.get("confirmed") or []) + (st.get("open") or [])
+                + (st.get("failed") or []))
+        for a in rows[:12]:
+            v = a.get("verdict") or "pending"
+            col = {"confirmed": "32", "failed": "31"}.get(v, "33")
+            lines.append(f"  \033[{col}m[{a.get('id','?')}] {v}\033[0m "
+                         f"{(a.get('objective') or '')[:44]}")
+        print(panel("ORACLE · VERIFIED EXPLOITATION", lines, color="36"))
+
+    def run_zday(self, user_input: str):
+        """`zday <path>` — variant-analysis source scan."""
+        z = _ext("zdayfind")
+        if z is None:
+            say_warn("zdayfind module unavailable.")
+            return
+        parts = user_input.split(None, 1)
+        path = parts[1].strip() if len(parts) > 1 else "."
+        say_athena(f"Scanning {path} for zero-day-class sink patterns…")
+        try:
+            r = z.zday_scan(path=path)
+        except Exception as e:
+            say_warn(f"zday scan failed: {e}")
+            return
+        hits = r.get("hits") or r.get("findings") or []
+        summary = r.get("summary") or f"{len(hits)} hit(s)"
+        lines = [f"  {summary}", ""]
+        for h in hits[:20]:
+            sev = (h.get("severity") or "?")[:4]
+            loc = f"{h.get('file','?')}:{h.get('line','?')}"
+            lines.append(f"  [{sev}] {h.get('id','?')}  {loc}")
+        print(panel(f"ZDAY SCAN · {path[:40]}", lines or ["(clean)"], color="33"))
+
+    def run_codescan(self, user_input: str):
+        """`codescan <path>` — detect stack + emit a SAST/SCA/secrets plan."""
+        c = _ext("codescan")
+        if c is None:
+            say_warn("codescan module unavailable.")
+            return
+        parts = user_input.split(None, 1)
+        path = parts[1].strip() if len(parts) > 1 else "."
+        try:
+            plan = c.scan_plan(path=path)
+        except Exception as e:
+            say_warn(f"codescan failed: {e}")
+            return
+        det = plan.get("detected") or {}
+        lines = [f"  path     : {path}",
+                 f"  detected : {json.dumps(det)[:60]}",
+                 f"  {plan.get('summary','')}", ""]
+        for step in (plan.get("steps") or [])[:14]:
+            if isinstance(step, dict):
+                lines.append(f"  • {step.get('tool','?'):<12} {step.get('cmd','')[:56]}")
+                if step.get("needs"):
+                    lines.append(f"      \033[90minstall: {step['needs']}\033[0m")
+        print(panel(f"CODESCAN PLAN · {path[:36]}", lines, color="36"))
 
     def repl(self):
         # v7.1 — cinematic boot
@@ -6208,6 +6716,16 @@ class AthenaSession:
                 self.show_mitre()
             elif cmd in ("status", "dashboard", "stat"):
                 self.show_dashboard()
+            elif cmd in ("memory", "mem"):
+                self.show_memory(user_input)
+            elif cmd == "oracle":
+                self.show_oracle()
+            elif cmd in ("zday", "zdayscan"):
+                self.run_zday(user_input)
+            elif cmd in ("codescan", "sast"):
+                self.run_codescan(user_input)
+            elif cmd == "ext":
+                self.show_ext_status()
             else:
                 self._agent_loop(user_input, workflow_key=None)
 

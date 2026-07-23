@@ -228,6 +228,18 @@ for f in athena.py athena_gui.py athena-gui requirements.txt README.md; do
         cp -f "$SRC_DIR/$f" "$INSTALL_DIR/$f"
     fi
 done
+
+# v7.4 — ship the athena_ext package (persistent memory, oracle, zdayfind,
+# codescan, headroom, foresight, sandbox).  Whole-dir copy so a newly added
+# module never gets silently dropped from a hand-maintained file list.
+if [[ -d "$SRC_DIR/athena_ext" ]]; then
+    rm -rf "$INSTALL_DIR/athena_ext"
+    cp -rf "$SRC_DIR/athena_ext" "$INSTALL_DIR/athena_ext"
+    rm -rf "$INSTALL_DIR/athena_ext/__pycache__" 2>/dev/null || true
+    ok "athena_ext copied ($(ls "$INSTALL_DIR/athena_ext"/*.py 2>/dev/null | wc -l) modules)"
+else
+    warn "athena_ext/ not found in source — smart subsystems will be disabled"
+fi
 chmod +x "$INSTALL_DIR/athena.py" "$INSTALL_DIR/athena-gui" 2>/dev/null || true
 ok "files copied"
 
