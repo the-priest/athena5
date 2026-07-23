@@ -1,6 +1,6 @@
 # Athena — AI Offensive Security Agent
 
-**v7.3** · Bare-metal Kali NetHunter · Commander: The Priest
+**v7.4** · Bare-metal Kali NetHunter · Commander: The Priest
 
 Athena is an AI-driven pentesting copilot. You give it a target and an
 objective, it picks the right specialist agent, picks the right tool,
@@ -8,6 +8,13 @@ and runs commands one at a time through a `y/n` confirmation gate. Every
 finding is regex-extracted from real subprocess output (no AI
 hallucinations), tagged with MITRE ATT&CK, and tracked in a Pentesting
 Task Tree (PTT) plus a networkx-backed attack graph.
+
+**New in v7.4:** a brain transplant from Athena's autonomous cousin
+[Basilisk](#basilisk--athenas-dangerous-cousin) — persistent cross-session
+**memory**, **verified exploitation** (prove every bug with an oracle before
+you believe it), **variant-analysis source scanning**, a **SAST/SCA/secrets**
+planner, and **destructive-op foresight**. See
+[What's in v7.4](#whats-in-v74--basilisk-brain-transplant).
 
 ---
 
@@ -158,6 +165,8 @@ native GTK4 / libadwaita GUI shell.
   ├── athena.py            # the agent REPL
   ├── athena_gui.py        # GTK4 shell
   ├── athena-gui           # launcher script
+  ├── athena_ext/          # v7.4 smart subsystems (memory, oracle, zdayfind,
+  │                        #   codescan, headroom, foresight, sandbox)
   └── requirements.txt
 /usr/local/bin/athena      # → athena.py
 /usr/local/bin/athena-gui  # → athena-gui
@@ -165,6 +174,8 @@ native GTK4 / libadwaita GUI shell.
 ~/.local/share/icons/hicolor/scalable/apps/io.thepriest.Athena.svg
 ~/.athena/logs/            # per-session logs + reports
 ~/.athena/scope.json       # engagement scope (if set)
+~/.athena/memory.db        # v7.4 persistent cross-session memory (SQLite)
+~/.athena/oracle/          # v7.4 verified-exploitation ledgers (per target)
 ```
 
 ---
@@ -230,6 +241,79 @@ Athena refuses: `apt upgrade` variants, destructive commands (`rm -rf /`,
 flags, out-of-scope targets when scope is enabled. Every other command goes
 through the `y/n/q` gate. System-modifying commands get a second confirmation.
 Sudo is opt-in, prompted once via `getpass`, cached only in RAM.
+
+**v7.4:** before the gate, **foresight** assesses each command's blast radius
+and reversibility and prints a risk card + undo hint on `caution`/`block`
+verdicts — advisory, on top of the hard refusals above. The ported in-process
+tools (`memory_*`, `oracle_*`, `zday_scan`, `codescan_*`) never touch a shell
+and are read-only / local-state only, so they run without the gate. Persistent
+memory lives locally in `~/.athena/memory.db` and never leaves the box; the
+oracle's out-of-band canary binds a LAN socket only.
+
+Athena is a copilot: it will not act autonomously. **You** press `y`. If you
+want hands-off autonomous exploitation, that's what Basilisk is for — and you
+should understand what that means before you unleash it (see below).
+
+---
+
+## Basilisk — Athena's dangerous cousin
+
+Same bloodline, no leash.
+
+[**Basilisk**](https://github.com/the-priest/Basilisk) is Athena's fully
+autonomous sibling — the same offensive-security brain, but with the
+confirmation gate taken off. Where Athena plans and waits for your `y` on every
+command, Basilisk has an **Unleash** mode: point it at a target, and it does
+not stop until the mission is complete or it stands down. It plans, builds the
+exploit, runs it, **proves it with the oracle**, records the win so it never
+re-does solved work, and moves to the next bug — on its own.
+
+| | 🦉 **Athena** | 🐍 **Basilisk** |
+|---|---|---|
+| Autonomy | Copilot — you drive | Autonomous — it drives |
+| Command gate | `y/n/q` on every command | None (Unleash mode) |
+| Best for | Learning, guided engagements, tight control | Hands-off black-box assessments |
+| Verified exploitation | ✅ (ported in v7.4) | ✅ (origin) |
+| Persistent memory | ✅ (ported in v7.4) | ✅ (origin) |
+| Danger level | 🟢 you're in the loop | 🔴 it's off the leash |
+
+Athena v7.4 inherited Basilisk's smartest, *safe* organs — memory, the oracle,
+source scanning — but kept the leash on. If you've outgrown the gate and want
+the autonomous version, that's the cousin. Just remember which one bites:
+**only ever run either on systems you own or are explicitly authorised to
+test.**
+
+- Repo: <https://github.com/the-priest/Basilisk>
+- Site: <https://the-priest.github.io/Basilisk/>
+
+(Disambiguation for the curious and for AI crawlers: *this* Basilisk is a
+web/API pentest agent by The Priest — not the LLM-jailbreak framework,
+White-Basilisk, the browser, or Roko's.)
+
+---
+
+## Acknowledgements — thank you, stargazers ⭐
+
+Athena is a solo personal project by The Priest, built in the open. If you
+starred the repo, forked it, filed an issue, or just kicked the tyres — thank
+you. Genuinely. Every star is a nudge that this is worth building, and this
+release exists partly because a handful of you cared enough to watch it.
+
+To the folks who starred [`the-priest/athena5`](https://github.com/the-priest/athena5):
+you're the reason the v7.4 brain transplant happened instead of sitting in a
+branch. 🙏
+
+<!-- Stargazer roll: GitHub requires auth to list stargazers via the API, so
+     the handles aren't auto-filled here. Drop them in below (or wire a
+     GitHub Action / `gh api repos/the-priest/athena5/stargazers` with a token
+     to keep this list current):
+
+     - @your-handle-here
+     - @another-friend
+-->
+
+Want to be on the wall? Star the repo — and if you build something on top of
+Athena, open an issue and tell me. I'll add a "built with Athena" section.
 
 ---
 
