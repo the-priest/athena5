@@ -335,6 +335,31 @@ else
     ok "GROQ_API_KEY already configured"
 fi
 
+# ── 8b. SILICONFLOW_API_KEY (optional second provider) ─────────────
+step "SiliconFlow API key (optional)"
+SF_IN_RC=0
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [[ -f "$rc" ]] && grep -q "SILICONFLOW_API_KEY" "$rc" && SF_IN_RC=1 && break
+done
+if [[ -z "${SILICONFLOW_API_KEY:-}" && $SF_IN_RC == 0 ]]; then
+    if [[ -t 0 ]]; then
+        say "    Optional: adds Kimi/GLM/Qwen/DeepSeek to the fallback chain."
+        say "    Free key: https://cloud.siliconflow.com/account/ak"
+        read -r -p "    Paste SiliconFlow key (or Enter to skip): " sfkey
+        if [[ -n "${sfkey:-}" ]]; then
+            for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+                [[ -f "$rc" ]] || continue
+                printf "export SILICONFLOW_API_KEY=%s\n" "$sfkey" >> "$rc"
+                ok "SiliconFlow key written to $rc"
+            done
+        else
+            say "    skipped — Athena runs Groq-only until you set it"
+        fi
+    fi
+else
+    ok "SILICONFLOW_API_KEY already configured"
+fi
+
 # ── done ───────────────────────────────────────────────────────────
 say ""
 say "${GRN}${MAG}╭──────────────────────────────────────────────────╮${RST}"

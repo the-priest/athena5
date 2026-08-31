@@ -33,7 +33,6 @@ capability AND the host passes allow_net=True.
 
 from __future__ import annotations
 
-import json
 import os
 import resource
 import shutil
@@ -41,8 +40,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 DEFAULT_TIMEOUT = 20

@@ -1,6 +1,6 @@
 # Athena — AI Offensive Security Agent
 
-**v7.4** · Bare-metal Kali NetHunter · Commander: The Priest
+**v7.7** · Bare-metal Kali NetHunter · Commander: The Priest
 
 Athena is an AI-driven pentesting copilot. You give it a target and an
 objective, it picks the right specialist agent, picks the right tool,
@@ -73,6 +73,67 @@ athena
 
 First launch prompts for your Groq API key (free — console.groq.com) and
 writes it to `~/.bashrc` and `~/.zshrc`.
+
+---
+
+## What's in v7.7 — Basilisk-grade web/API arsenal
+
+The single biggest jump in how *well* Athena hacks. Athena's web knowledge was
+one shallow section; v7.7 adds **S17 — a deep web/API exploitation knowledge
+base distilled directly from Basilisk's exploit builders** (the knowledge that
+scores 87/113 on Juice Shop), rewritten as copilot guidance. On a web or API
+engagement Athena now proposes the *precise* payload, not just the tool:
+
+- **NoSQL** — auth-bypass (`{"$ne":null}`), blind `$regex` exfiltration, `$where` eval
+- **JWT** — `alg:none`, **RS256→HS256 key confusion**, `kid` injection, weak-secret crack
+- **SSTI** — engine-specific RCE for Jinja2 / Twig / Freemarker / Velocity after `{{7*7}}`
+- **Deserialisation RCE** — the right gadget per platform (node · pickle · ysoserial · phpggc · .NET · ruby)
+- **Prototype pollution**, **GraphQL** abuse, **SSRF** filter bypasses (decimal IP, rebinding, gopher)
+- **Request smuggling** (CL.TE / TE.CL), **IDOR/BOLA**, **mass-assignment/BFLA**, **business-logic**
+- File-upload bypass matrix (double-ext, null byte, `.phtml`/`.phar`, magic bytes, polyglot)
+
+It's routed intelligently — pulled in only on web/API workflows, the `web`
+agent role, or when the request mentions web-attack terms (nosql, ssti, jwt,
+graphql, idor, deserial, …). Network / AD / privesc turns never pay for it, so
+the token budget stays lean. And it's pinned past the section cap so it can't
+get trimmed off exactly when it matters.
+
+**Same leash.** This makes Athena *propose* Basilisk-quality attacks. She still
+plans, you still press `y` on every command, and the discipline is unchanged:
+confirm each bug with real evidence (a dumped row, a reflected `49`, a forged
+token that validates, an OOB callback) before calling it proven.
+
+---
+
+## What's in v7.6 — SiliconFlow provider
+
+Athena gains an optional **second model provider: SiliconFlow**. Set
+`SILICONFLOW_API_KEY` and the fallback chain extends with large open models —
+Kimi K2, GLM 4.5, Qwen3 / Qwen2.5 72B, DeepSeek V3 — so a rate-limited free Groq
+tier rolls onto SiliconFlow mid-engagement instead of stalling. SiliconFlow is
+OpenAI-compatible, so there's no new Python dependency (the `groq` client is
+reused against SiliconFlow's endpoint). No key ⇒ those rows are skipped and
+Athena runs Groq-only exactly as before. `model` shows the full chain and which
+rows are live. See [API keys](#api-keys--groq-required--siliconflow-optional).
+
+---
+
+## What's in v7.5 — deeper brain, same leash
+
+v7.5 ports four more *safe* organs from Basilisk. Every one is stdlib-only,
+lazy-loaded, fail-soft, and **changes nothing about the `y/n` gate** — Athena is
+still the copilot you drive. Bigger and smarter, still on the leash.
+
+| Subsystem | What Athena gains |
+|-----------|-------------------|
+| **webshield** | **Indirect-prompt-injection firewall.** Athena runs commands that pull attacker-controlled text (`curl` a page, `crt.sh` JSON, a fetched body) and feeds it back into the model. A hostile page can hide "ignore previous instructions" / fake system tags / exfil lures in there. webshield strips executable markup (`<script>`, comments, event handlers, zero-width/bidi obfuscation), redacts known injection patterns deterministically, and wraps the rest in `⟦UNTRUSTED WEB CONTENT⟧` markers **before** the model sees it. Wired narrowly (only web-fetching commands route through it; a local `nmap`/`cat` is untouched) and fail-soft. |
+| **engage** | **Engagement state the model can reason over.** A richer scope + asset graph on top of Athena's existing RoE: `scope_check` answers "is this target authorised?" and **fails closed** (unknown ⇒ not in scope); `asset_record` builds a structured picture of each host/service/finding; `graph_query` reads the whole job back so the model reasons over the engagement, not just the last command. New in-process tools: `scope_check`, `scope_show`, `asset_record`, `graph_query`. |
+| **recall** | **Anti-repetition.** Catches the *harder* kind of loop — re-running something done three or four steps ago with other actions in between, which the simple back-to-back loop-breaker misses. |
+| **unblock** | **Tells SLOW apart from STUCK.** A wall-clock timeout can't distinguish a 25-minute `nmap -p-` doing real work from a `curl` hung on a dead socket. This is the primitive that salvages partial work instead of throwing away a long scan. |
+
+The `scope_check` / `asset_record` / `graph_query` tools run in-process (no shell,
+no `y/n` gate — they're local-state only), the same as the v7.4 tools. Check
+load state any time with `ext`.
 
 ---
 
@@ -166,8 +227,9 @@ native GTK4 / libadwaita GUI shell.
   ├── athena.py            # the agent REPL
   ├── athena_gui.py        # GTK4 shell
   ├── athena-gui           # launcher script
-  ├── athena_ext/          # v7.4 smart subsystems (memory, oracle, zdayfind,
-  │                        #   codescan, headroom, foresight, sandbox)
+  ├── athena_ext/          # smart subsystems (memory, oracle, zdayfind,
+  │                        #   codescan, headroom, foresight, sandbox, +v7.5:
+  │                        #   webshield, engage, recall, unblock)
   └── requirements.txt
 /usr/local/bin/athena      # → athena.py
 /usr/local/bin/athena-gui  # → athena-gui
@@ -212,15 +274,30 @@ Or just type any objective in plain English — Athena routes to the right speci
 
 ---
 
-## Groq API key
+## API keys — Groq (required) + SiliconFlow (optional)
 
-Free tier at [console.groq.com](https://console.groq.com). No card required.
+Athena runs on **Groq** by default. Free tier at
+[console.groq.com](https://console.groq.com), no card required:
 
 ```
 export GROQ_API_KEY='gsk_...'
 ```
 
-Add to `~/.bashrc` to persist. The installer does this automatically.
+**v7.6 — optional second provider: SiliconFlow.** Set a SiliconFlow key and
+Athena adds large open models — **Kimi K2, GLM 4.5, Qwen3 / Qwen2.5 72B,
+DeepSeek V3** — to the bottom of the fallback chain. When the free Groq tier
+rate-limits you mid-engagement, Athena rolls onto SiliconFlow instead of
+stalling. It's OpenAI-compatible, so no extra Python dependency — the existing
+`groq` client is pointed at SiliconFlow's endpoint. Free key at
+[cloud.siliconflow.com/account/ak](https://cloud.siliconflow.com/account/ak):
+
+```
+export SILICONFLOW_API_KEY='sk-...'
+```
+
+With no SiliconFlow key set, those models are simply skipped and Athena behaves
+exactly as a Groq-only install. Add either to `~/.bashrc` to persist — the
+installer prompts for both.
 
 ---
 

