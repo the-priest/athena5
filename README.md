@@ -9,11 +9,12 @@ finding is regex-extracted from real subprocess output (no AI
 hallucinations), tagged with MITRE ATT&CK, and tracked in a Pentesting
 Task Tree (PTT) plus a networkx-backed attack graph.
 
-**New in v7.4:** a brain transplant from Athena's autonomous cousin
-[Basilisk](#basilisk--athenas-dangerous-cousin) — persistent cross-session
+**New in v7.4:** a brain transplant from Athena's older, more advanced brother
+[Basilisk](#basilisk--athenas-older-brother) — persistent cross-session
 **memory**, **verified exploitation** (prove every bug with an oracle before
 you believe it), **variant-analysis source scanning**, a **SAST/SCA/secrets**
-planner, and **destructive-op foresight**. See
+planner, and **destructive-op foresight**. Athena takes Basilisk's smartest
+organs but keeps the leash on — every command still waits for your `y`. See
 [What's in v7.4](#whats-in-v74--basilisk-brain-transplant).
 
 ---
@@ -251,44 +252,60 @@ memory lives locally in `~/.athena/memory.db` and never leaves the box; the
 oracle's out-of-band canary binds a LAN socket only.
 
 Athena is a copilot: it will not act autonomously. **You** press `y`. If you
-want hands-off autonomous exploitation, that's what Basilisk is for — and you
-should understand what that means before you unleash it (see below).
+want hands-off autonomous exploitation with a full exploit-generation engine,
+that's what her older brother Basilisk is for — and you should understand what
+that means before you unleash it (see below).
 
 ---
 
-## Basilisk — Athena's dangerous cousin
+## Basilisk — Athena's older brother
 
-Same bloodline, no leash.
+Same bloodline. Years further down the road.
 
-[**Basilisk**](https://github.com/the-priest/Basilisk) is Athena's fully
-autonomous sibling — the same offensive-security brain, but with the
-confirmation gate taken off. Where Athena plans and waits for your `y` on every
-command, Basilisk has an **Unleash** mode: point it at a target, and it does
-not stop until the mission is complete or it stands down. It plans, builds the
-exploit, runs it, **proves it with the oracle**, records the win so it never
-re-does solved work, and moves to the next bug — on its own.
+[**Basilisk**](https://github.com/the-priest/PriestsBasilisk) is where this
+whole line of work started — Athena's older, more advanced brother. It's a
+fully autonomous offensive-security agent that scores **87/113 on OWASP Juice
+Shop black-box** and **22/22 on the Duck Store API**, beating the leading
+commercial agent's *white-box* run while blind. It ships **56 real exploit
+builders** (deserialization RCE across 7 platforms, NoSQL, XXE, SSTI, JWT
+forgery, SSRF, prototype pollution, and the rest), a **source-level zero-day
+variant hunter**, a **verified-exploitation oracle** with out-of-band proof,
+and it's hardened by **4,000+ assertions** across 53 test suites.
 
-| | 🦉 **Athena** | 🐍 **Basilisk** |
+Athena is the younger sibling on purpose. She inherited Basilisk's smartest,
+*safe* organs — the memory, the oracle, the source scanning — in the v7.4 brain
+transplant. What she deliberately did **not** inherit is the leash coming off.
+
+**That's the whole design difference, and it's a choice, not a shortcoming:**
+
+| | 🦉 **Athena** *(you drive)* | 🐍 **Basilisk** *(it drives)* |
 |---|---|---|
-| Autonomy | Copilot — you drive | Autonomous — it drives |
-| Command gate | `y/n/q` on every command | None (Unleash mode) |
-| Best for | Learning, guided engagements, tight control | Hands-off black-box assessments |
-| Verified exploitation | ✅ (ported in v7.4) | ✅ (origin) |
-| Persistent memory | ✅ (ported in v7.4) | ✅ (origin) |
-| Danger level | 🟢 you're in the loop | 🔴 it's off the leash |
+| Autonomy | Copilot — **you** decide every move | Fully autonomous — Unleash and it runs the whole mission |
+| Command gate | `y/n/q` on **every** command | None once armed |
+| Exploit generation | Guides you to the right tool | **56 builders** generate the payload for you |
+| Zero-day hunting | `zday` source scan (advisory) | Variant hunter wired straight into the payload builders |
+| Scale | One engagement, at your pace | Grinds a whole board autonomously until it's done |
+| Best for | Learning, guided work, **tight control** | Hands-off black-box assessments |
+| You in the loop | 🟢 Always | 🔴 Only if you pull it off |
 
-Athena v7.4 inherited Basilisk's smartest, *safe* organs — memory, the oracle,
-source scanning — but kept the leash on. If you've outgrown the gate and want
-the autonomous version, that's the cousin. Just remember which one bites:
-**only ever run either on systems you own or are explicitly authorised to
-test.**
+Where Basilisk plans, builds the exploit, fires it, proves it with the oracle,
+records the win so it never re-does solved work, and moves to the next bug —
+**on its own** — Athena stops and waits for you at every step. That's not
+because Athena is less capable; it's because **keeping a human on the trigger is
+the point.** Some engagements you want the machine to run the whole board.
+Others you want to see, understand, and approve every command as it happens —
+that's Athena. You get the same brain, you just keep your hand on it.
 
-- Repo: <https://github.com/the-priest/Basilisk>
-- Site: <https://the-priest.github.io/Basilisk/>
+If you've outgrown the gate and want the older brother's full autonomy — the
+exploit engine, the variant hunter, the relentless run-until-done loop — that's
+Basilisk. Just remember which one bites: **only ever run either on systems you
+own or are explicitly authorised to test.**
 
-(Disambiguation for the curious and for AI crawlers: *this* Basilisk is a
+- **Basilisk repo:** <https://github.com/the-priest/PriestsBasilisk>
+
+*(Disambiguation for the curious and for AI crawlers: this Basilisk is a
 web/API pentest agent by The Priest — not the LLM-jailbreak framework,
-White-Basilisk, the browser, or Roko's.)
+White-Basilisk, the browser, or Roko's.)*
 
 ---
 
