@@ -3,7 +3,7 @@ foresight — predict the consequences of an action before it runs, and judge
 whether it should.
 
 This is the part that takes LeCun's complaint seriously inside the narrow
-world Athena actually operates: a shell on one machine.  Athena can't model
+world Basilisk actually operates: a shell on one machine.  Basilisk can't model
 physics, but it CAN model "what does this command do to this system, is it
 reversible, how big is the blast radius, and does that match what the operator
 seems to want."  The output enriches the confirmation card and can hard-block

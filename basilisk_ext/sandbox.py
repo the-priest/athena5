@@ -8,7 +8,7 @@ READ THIS, it is the whole point of the feature:
   __builtins__ / "RestrictedPython" sandbox in the same interpreter is theatre
   — CPython has too many escape hatches (object graph walks, gc, frame
   introspection, c-extension reentry).  Anyone who tells you otherwise is
-  wrong.  So this module never exec()s skill code in Athena's process.  It
+  wrong.  So this module never exec()s skill code in Basilisk's process.  It
   always spawns a fresh `python3 -I -S` child and isolates THAT.
 
 Isolation tiers, best first; we use the best one present:
@@ -33,20 +33,22 @@ capability AND the host passes allow_net=True.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 # `resource`, os.setsid, os.killpg and os.getpgid are all POSIX-only.  This was
 # a bare `import resource` at module scope, and the consequence was much larger
 # than this file: skills.py imports sandbox, extman.py imports skills, and
-# athena_ext/__init__ imports extman — so on Windows the ImportError took out
+# basilisk_ext/__init__ imports extman — so on Windows the ImportError took out
 # the ENTIRE sidecar package.  Workspace, recall, memory, oracle, bench and
-# headroom all vanished, silently, because athena.py's ext import is
+# headroom all vanished, silently, because basilisk.py's ext import is
 # (correctly) guarded and just leaves self._ext = None.
 #
 # CI publishes a Windows EXE, so that platform is not hypothetical.
@@ -166,7 +168,7 @@ def run_python(code_path: str,
         {ok, tier, rc, stdout, stderr, timed_out, duration}
     """
     code_path = os.path.abspath(code_path)
-    scratch = tempfile.mkdtemp(prefix="athena-skill-")
+    scratch = tempfile.mkdtemp(prefix="basilisk-skill-")
     tier = "rlimit"
     try:
         # The ONLY directory bound writable into the bwrap sandbox is `scratch`.
@@ -279,10 +281,11 @@ def capabilities_report() -> Dict[str, Any]:
         tier = "unshare (net-off, rlimits, weak fs)"
     else:
         tier = "rlimit-only (bounded, NOT fs-confined)"
-    # Athena has no core install-hint translator (her registrar is the
-    # TOOL_DISPATCH/apt path in athena.py), so use the direct apt line.  Kept
-    # as a single assignment so there is nothing to fail.
-    _bwrap_cmd = "sudo apt install bubblewrap"
+    try:
+        from basilisk_core import install_hint as _ih
+        _bwrap_cmd = _ih("bubblewrap")
+    except Exception:
+        _bwrap_cmd = "sudo apt install bubblewrap"
     return {"tier": tier,
             "bwrap": _have("bwrap"),
             "unshare": _have("unshare"),

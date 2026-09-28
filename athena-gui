@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
 # athena-gui — launches the Athena GTK4 GUI.
-# Resolves the install dir then execs athena_gui.py with system python.
+# Resolves the install dir (symlink-aware) then execs athena_gui.py.
 
 set -e
 
+# Resolve this script's real location so a symlink in /usr/local/bin still finds
+# the install dir it points into — works for a custom $ATHENA_INSTALL_DIR too.
+SELF="$0"
+if command -v readlink >/dev/null 2>&1; then
+    _resolved="$(readlink -f "$SELF" 2>/dev/null || true)"
+    [[ -n "$_resolved" ]] && SELF="$_resolved"
+fi
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
 for candidate in \
+    "${ATHENA_INSTALL_DIR:-}" \
+    "$SELF_DIR" \
     "${ATHENA_HOME:-}" \
     "/opt/athena5" \
     "$HOME/.local/share/athena5" \

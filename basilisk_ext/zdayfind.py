@@ -9,7 +9,7 @@ patterns — each one distilled from a class that has repeatedly produced real
 CVEs / zero-days — and flags every place a codebase reaches that sink with
 what looks like attacker-influenced input.
 
-It is a LEAD GENERATOR, not a prover. A hit means "a human (or Athena's
+It is a LEAD GENERATOR, not a prover. A hit means "a human (or Basilisk's
 exploit builders) should look here"; the verified-exploitation loop is what
 turns a lead into a confirmed finding. Precision is tuned to surface the
 dangerous shapes without drowning you — but expect to triage.

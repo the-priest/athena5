@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║          ATHENA GUI — Native pentest assistant · v7.4            ║
+# ║          ATHENA GUI — Native pentest assistant · v7.8            ║
 # ║                                                                  ║
-# ║   ZERO extra Groq calls — Athena's THOUGHT panels do the         ║
-# ║   teaching now (mentor persona injected into her system prompt). ║
+# ║   Dark, glassy libadwaita shell for the confirmation-gated       ║
+# ║   Athena agent.                                                   ║
 # ║                                                                  ║
 # ║   · Engagement wizard (target + goal in one form)                ║
 # ║   · Renders athena's [MANUAL] playbook panels as cards           ║
-# ║   · "I'm stuck" button just types 'stuck' to athena              ║
-# ║   · Persistent config + Groq key (~/.athena/config.json)         ║
+# ║   · Live header status dot: idle · thinking · executing · await  ║
+# ║   · Filterable command sidebar + toast feedback                  ║
+# ║   · Native Settings dialog — providers, live models, engines     ║
+# ║   · Persistent config + provider keys (~/.athena/settings.json)  ║
 # ║   · No idle/disabled input — always allow typing                 ║
 # ║   · libadwaita 1.6+ compatible dialogs with fallbacks            ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -26,6 +28,7 @@ import struct
 import signal
 import subprocess
 import shlex
+import threading
 from typing import Callable, Optional, List, Dict, Any
 
 import gi
@@ -41,11 +44,12 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 # ═════════════════════════════════════════════════════════════════════
 
 APP_ID = "io.thepriest.Athena"
-VERSION = "7.4"
+VERSION = "7.8"
 
 ATHENA_HOME = os.path.expanduser("~/.athena")
 LOG_DIR = os.path.join(ATHENA_HOME, "logs")
 CONFIG_PATH = os.path.join(ATHENA_HOME, "config.json")
+SETTINGS_PATH = os.path.join(ATHENA_HOME, "settings.json")
 
 SCRIPT_CANDIDATES = [
     os.environ.get("ATHENA_SCRIPT", ""),
@@ -109,211 +113,590 @@ class Config:
 
 
 # ═════════════════════════════════════════════════════════════════════
+# SHARED SETTINGS  (~/.athena/settings.json — same file athena.py uses)
+# ═════════════════════════════════════════════════════════════════════
+
+def load_settings() -> Dict[str, Any]:
+    try:
+        if os.path.exists(SETTINGS_PATH):
+            with open(SETTINGS_PATH) as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return d
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def save_settings(data: Dict[str, Any]) -> bool:
+    os.makedirs(ATHENA_HOME, exist_ok=True)
+    try:
+        tmp = SETTINGS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, SETTINGS_PATH)
+        os.chmod(SETTINGS_PATH, 0o600)
+        return True
+    except OSError:
+        return False
+
+
+def load_providers_module():
+    """Import athena_ext.providers from the install dir, or None.
+
+    Keeps the GUI DRY (one provider registry) without making the GUI depend on
+    the CLI starting first.  Fail-soft: None just means a static provider list.
+    """
+    script = find_athena_script()
+    if script:
+        d = os.path.dirname(script)
+        if d and d not in sys.path:
+            sys.path.insert(0, d)
+    try:
+        from athena_ext import providers as _p   # type: ignore
+        return _p
+    except Exception:
+        return None
+
+
+# Static fallback so the Settings dialog still works if athena_ext is missing.
+STATIC_PROVIDERS = [
+    ("groq", "Groq", "GROQ_API_KEY", True),
+    ("cerebras", "Cerebras (free)", "CEREBRAS_API_KEY", True),
+    ("siliconflow", "SiliconFlow", "SILICONFLOW_API_KEY", False),
+    ("openrouter", "OpenRouter (free tiers)", "OPENROUTER_API_KEY", True),
+    ("together", "Together AI", "TOGETHER_API_KEY", True),
+    ("mistral", "Mistral (free tier)", "MISTRAL_API_KEY", True),
+    ("deepseek", "DeepSeek", "DEEPSEEK_API_KEY", False),
+    ("google", "Google Gemini", "GEMINI_API_KEY", True),
+    ("openai", "OpenAI", "OPENAI_API_KEY", False),
+    ("xai", "xAI Grok", "XAI_API_KEY", False),
+    ("ollama", "Ollama (local)", "", True),
+]
+
+
+def provider_rows() -> List[Dict[str, Any]]:
+    """[{provider,label,env,free}] — from the live registry when possible."""
+    mod = load_providers_module()
+    if mod is not None:
+        try:
+            rows = []
+            for p in mod.ORDER:
+                meta = mod.REGISTRY.get(p, {})
+                rows.append({"provider": p, "label": meta.get("label", p),
+                             "env": meta.get("env", ""), "free": meta.get("free", False)})
+            if rows:
+                return rows
+        except Exception:
+            pass
+    return [{"provider": p, "label": l, "env": e, "free": f}
+            for (p, l, e, f) in STATIC_PROVIDERS]
+
+
+# ═════════════════════════════════════════════════════════════════════
 # CSS
 # ═════════════════════════════════════════════════════════════════════
 
 CSS = """
-window, .background { background-color: #0a0612; }
 
-headerbar {
-    background-color: #15101f;
-    border-bottom: 1px solid #2a1a3a;
-    min-height: 48px;
+/* ═══════════════════════════════════════════════════════════════════
+   ATHENA · design system  (v7.8)
+   ───────────────────────────────────────────────────────────────────
+   void     #07050e   surface  #120f1e   raised  #181328
+   line     #241d38   line-hi  #3a2f5c
+   violet   #a855f7   magenta  #e879f9   cyan    #22d3ee
+   emerald  #34d399   amber    #fbbf24   rose    #fb7185
+   text     #ece7f7   text-2   #b3a9cf   text-3  #756c93
+   ═══════════════════════════════════════════════════════════════════ */
+
+window, .background {
+    background-color: #07050e;
+    background-image:
+        radial-gradient(circle at 16% 0%, rgba(124, 58, 237, 0.20) 0%, rgba(7, 5, 14, 0) 48%),
+        radial-gradient(circle at 100% 100%, rgba(34, 211, 238, 0.10) 0%, rgba(7, 5, 14, 0) 44%);
+    color: #ece7f7;
 }
-.headerbar-target { color: #b9e9c9; font-family: monospace; font-size: 12px; }
-.headerbar-agent  { color: #e9d9b9; font-family: monospace; font-size: 11px; }
 
-.feed { background: #0a0612; padding: 8px; }
-.feed-inner { padding-bottom: 80px; }
+/* ── header bar ─────────────────────────────────────────────────── */
+headerbar {
+    background: linear-gradient(180deg, #16112a 0%, #110d20 100%);
+    border-bottom: 1px solid #241d38;
+    min-height: 46px;
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.02), 0 6px 24px rgba(0, 0, 0, 0.5);
+}
+headerbar button {
+    background: transparent;
+    border: none;
+    border-radius: 9px;
+    color: #b3a9cf;
+}
+headerbar button:hover { background: #221a3a; color: #ece7f7; }
 
+.app-title {
+    color: #f5f2ff;
+    font-size: 15px;
+    font-weight: 800;
+    letter-spacing: 5px;
+}
+.version-pill {
+    background: #1c1530;
+    border: 1px solid #322652;
+    color: #a78bfa;
+    border-radius: 999px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    padding: 1px 7px;
+}
+.status-dot {
+    min-width: 9px;
+    min-height: 9px;
+    border-radius: 999px;
+    background: #4b4266;
+}
+.status-dot.st-idle      { background: #4b4266; }
+.status-dot.st-thinking  { background: #a855f7; box-shadow: 0 0 10px rgba(168, 85, 247, 0.85); }
+.status-dot.st-executing { background: #22d3ee; box-shadow: 0 0 10px rgba(34, 211, 238, 0.85); }
+.status-dot.st-await     { background: #fbbf24; box-shadow: 0 0 10px rgba(251, 191, 36, 0.85); }
+.status-dot.st-done      { background: #34d399; box-shadow: 0 0 10px rgba(52, 211, 153, 0.85); }
+
+.headerbar-target {
+    color: #9ee7c1;
+    font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
+    font-size: 11px;
+}
+.headerbar-agent {
+    color: #8b82a8;
+    font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
+    font-size: 10px;
+}
+
+/* ── feed ───────────────────────────────────────────────────────── */
+.feed { background: transparent; padding: 10px 6px; }
+.feed-inner { padding: 4px 6px 96px 6px; }
+
+/* ── cards ──────────────────────────────────────────────────────── */
 .card {
-    background: #18102a;
-    border: 1px solid #2a1a3a;
+    background-image: linear-gradient(180deg, #15112a 0%, #110e21 100%);
+    background-color: #120f1e;
+    border: 1px solid #241d38;
     border-radius: 14px;
     padding: 12px 14px;
     margin: 6px 4px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+    transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+.card:hover {
+    border-color: #3a2f5c;
+    box-shadow: 0 4px 22px rgba(88, 28, 135, 0.22);
 }
 .card-title {
-    font-size: 10px; font-weight: 700;
-    letter-spacing: 1.8px; color: #9d7da0;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.8px;
+    color: #8b82a8;
     margin-bottom: 6px;
 }
-.card-body { color: #e6dcf0; font-size: 14px; }
+.card-body { color: #dfd8f2; font-size: 14px; }
 
+/* type accents */
+.thought   { border-left: 3px solid #7c3aed; background-image: linear-gradient(180deg, #171033 0%, #120d24 100%); }
+.command   { border-left: 3px solid #22d3ee; background-image: linear-gradient(180deg, #0c1a26 0%, #0a1420 100%); }
+.result    { border-left: 3px solid #64748b; }
+.findings  { border-left: 3px solid #34d399; background-image: linear-gradient(180deg, #0c1d18 0%, #0a1512 100%); }
+.error     { border-left: 3px solid #fb7185; background-image: linear-gradient(180deg, #220e17 0%, #170a11 100%); }
+.manual    { border-left: 3px solid #fbbf24; background-image: linear-gradient(180deg, #1f1607 0%, #150f06 100%); }
+
+.thought .card-title  { color: #c084fc; }
+.command .card-title  { color: #67e8f9; }
+.result .card-title   { color: #94a3b8; }
+.findings .card-title { color: #6ee7b7; }
+.error .card-title    { color: #fda4af; }
+.manual .card-title   { color: #fcd34d; }
+
+.thought .card-body { font-style: italic; color: #ddd0f2; }
+
+/* ── welcome ────────────────────────────────────────────────────── */
 .welcome {
-    background: linear-gradient(180deg, #1a1030 0%, #0a0612 100%);
-    border-color: #4a2a6a; padding: 18px;
+    background-color: #120d24;
+    background-image:
+        radial-gradient(circle at 0% 0%, rgba(168, 85, 247, 0.28) 0%, rgba(168, 85, 247, 0) 55%),
+        linear-gradient(180deg, #1a1236 0%, #0d0a1c 100%);
+    border: 1px solid #4c2f7a;
+    border-left: 3px solid #a855f7;
+    padding: 20px 18px;
+    box-shadow: 0 10px 40px rgba(88, 28, 135, 0.28);
+}
+.welcome-mark {
+    color: #e879f9;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 4px;
+    margin-bottom: 4px;
 }
 .welcome-title {
-    color: #cc66ff; font-size: 22px; font-weight: 700;
-    letter-spacing: 1px; margin-bottom: 4px;
+    color: #f5f2ff;
+    font-size: 24px;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+    margin-bottom: 6px;
 }
-.welcome-sub { color: #b8a8c8; font-size: 13px; margin-bottom: 12px; }
+.welcome-sub { color: #b3a9cf; font-size: 13px; margin-bottom: 14px; }
+.welcome-chips { margin-bottom: 14px; }
+.chip {
+    background: #1e1638;
+    border: 1px solid #33265a;
+    color: #c4b5fd;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    padding: 4px 10px;
+}
 .welcome-btn {
-    background: #cc66ff; color: #0a0612;
-    border-radius: 12px; padding: 14px; min-height: 52px;
-    font-weight: 700; font-size: 14px;
+    background-image: linear-gradient(180deg, #c084fc 0%, #a855f7 100%);
+    background-color: #a855f7;
+    color: #14091f;
+    border: none;
+    border-radius: 12px;
+    padding: 14px;
+    min-height: 52px;
+    font-weight: 800;
+    font-size: 14px;
+    letter-spacing: 0.4px;
+    box-shadow: 0 8px 24px rgba(168, 85, 247, 0.35);
 }
+.welcome-btn:hover { background-image: linear-gradient(180deg, #d8b4fe 0%, #b975f8 100%); }
 
-.thought {
-    background: linear-gradient(180deg, #1a1030 0%, #14082a 100%);
-    border-color: #4a2a6a;
-}
-.thought .card-title { color: #cc88ff; }
-.thought .card-body { font-style: italic; color: #d9c9e9; }
-
-.command { background: #0e1a22; border-color: #2a4a5a; }
-.command .card-title { color: #66ccff; }
+/* ── command ────────────────────────────────────────────────────── */
 .cmd-code {
-    background: #050a0e; border: 1px solid #1a3a4a;
-    border-radius: 8px; padding: 10px 12px;
-    color: #b9e9ff;
+    background-color: #05040c;
+    border: 1px solid #1b2f42;
+    border-left: 2px solid #22d3ee;
+    border-radius: 9px;
+    padding: 12px 14px;
+    color: #b9f0ff;
     font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
     font-size: 13px;
 }
 
 .conf-pill {
-    padding: 3px 9px; border-radius: 999px;
-    font-size: 10px; font-weight: 700; letter-spacing: 1.2px; color: white;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.2px;
+    color: #08060f;
 }
-.conf-green  { background: #2a8a3a; }
-.conf-yellow { background: #aa8a1a; color: #1a1006; }
-.conf-red    { background: #aa2a3a; }
+.conf-green  { background: #34d399; }
+.conf-yellow { background: #fbbf24; }
+.conf-red    { background: #fb7185; color: #ffffff; }
 .attack-pill {
-    padding: 3px 9px; border-radius: 999px;
-    font-size: 10px; font-weight: 600; letter-spacing: 1px;
-    background: #2a1030; color: #cc88ff; border: 1px solid #4a2a6a;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+    background: #241640;
+    color: #c4b5fd;
+    border: 1px solid #4c2f7a;
 }
 
-.decision-bar {
-    margin-top: 12px; border-top: 1px solid #1a3a4a; padding-top: 12px;
-}
+.decision-bar { margin-top: 12px; border-top: 1px solid #1b2f42; padding-top: 12px; }
 .btn-run, .btn-skip, .btn-quit {
-    padding: 14px 12px; border-radius: 10px; font-weight: 700;
-    font-size: 14px; letter-spacing: 0.5px; min-height: 52px;
+    padding: 13px 12px;
+    border-radius: 11px;
+    font-weight: 800;
+    font-size: 14px;
+    letter-spacing: 0.4px;
+    min-height: 50px;
+    border: none;
 }
-.btn-run  { background: #2a8a3a; color: white; border: 1px solid #3aa04a; }
-.btn-skip { background: #6a5a1a; color: #fff5cc; border: 1px solid #8a7a2a; }
-.btn-quit { background: #4a2a2a; color: #ffcccc; border: 1px solid #6a3a3a; }
-.btn-run:hover  { background: #3aa04a; }
-.btn-skip:hover { background: #7a6a2a; }
-.btn-quit:hover { background: #5a3a3a; }
-.decision-done {
-    padding: 8px 12px; border-radius: 999px;
-    background: #1a3a2a; color: #b9e9c9;
-    font-size: 11px; font-weight: 600;
-}
-.decision-done.skipped { background: #3a2a1a; color: #e9d9b9; }
-.decision-done.quit    { background: #3a1a1a; color: #e9b9b9; }
+.btn-run  { background-image: linear-gradient(180deg, #34d399, #059669); color: #04140d; box-shadow: 0 6px 18px rgba(5, 150, 105, 0.30); }
+.btn-skip { background-image: linear-gradient(180deg, #fbbf24, #d97706); color: #1a1203; }
+.btn-quit { background-image: linear-gradient(180deg, #fb7185, #e11d48); color: #ffffff; }
+.btn-run:hover  { background-image: linear-gradient(180deg, #5eead4, #10b981); }
+.btn-skip:hover { background-image: linear-gradient(180deg, #fcd34d, #f59e0b); }
+.btn-quit:hover { background-image: linear-gradient(180deg, #fda4af, #f43f5e); }
 
-.result { border-color: #2a3a4a; }
-.result .card-title { color: #88c0a0; }
+.decision-done {
+    padding: 8px 14px;
+    border-radius: 999px;
+    background: #0f2e22;
+    color: #6ee7b7;
+    font-size: 11px;
+    font-weight: 700;
+    border: 1px solid #155e3f;
+}
+.decision-done.skipped { background: #2e2408; color: #fcd34d; border-color: #5a4409; }
+.decision-done.quit    { background: #2e0f15; color: #fda4af; border-color: #5a1b26; }
+
+/* ── result ─────────────────────────────────────────────────────── */
 .result-output {
-    background: #050810; border-radius: 8px; padding: 10px;
-    color: #c0c8d0;
-    font-family: "JetBrains Mono", monospace;
+    background-color: #05040c;
+    border: 1px solid #1e293b;
+    border-radius: 9px;
+    padding: 11px 13px;
+    color: #cbd5e1;
+    font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
     font-size: 12px;
 }
 
-.findings { background: #0e1a14; border-color: #2a5a3a; }
-.findings .card-title { color: #88dd99; }
+/* ── findings ───────────────────────────────────────────────────── */
 .finding-row {
-    padding: 6px 0; color: #d8f0e0; font-size: 13px;
-    border-bottom: 1px solid #1a2a1a;
+    padding: 7px 0;
+    color: #d1fae5;
+    font-size: 13px;
+    border-bottom: 1px solid #123024;
 }
+.finding-row:last-child { border-bottom: none; }
 
-.error { background: #1a0a0e; border-color: #5a2a2a; }
-.error .card-title { color: #ff7788; }
-
-/* manual playbook (from Athena's [MANUAL] tag) */
-.manual {
-    background: #1a1408; border-color: #6a5020;
-}
-.manual .card-title { color: #ffcc66; }
+/* ── manual playbook ────────────────────────────────────────────── */
 .manual-step {
-    background: #25200a; border-radius: 6px;
-    padding: 10px 12px; margin: 3px 0;
-    color: #f0e0c0; font-size: 13px;
+    background: #1f1607;
+    border: 1px solid #3a2c0a;
+    border-left: 2px solid #fbbf24;
+    border-radius: 7px;
+    padding: 10px 12px;
+    margin: 4px 0;
+    color: #fde9c0;
+    font-size: 13px;
 }
 
+/* ── dispatch / executing / turn / plain ────────────────────────── */
 .dispatch, .executing {
-    background: transparent; border: none;
-    padding: 4px 12px; margin: 2px 8px;
+    background: transparent;
+    border: none;
+    padding: 4px 12px;
+    margin: 2px 8px;
+    box-shadow: none;
 }
 .dispatch .card-body, .executing .card-body {
-    color: #8d7da0; font-size: 11px; letter-spacing: 1px;
-    font-family: monospace;
+    color: #756c93;
+    font-size: 11px;
+    letter-spacing: 1.2px;
+    font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
 }
-
-.banner {
-    background: #0a0612; border: 1px solid #4a2a6a;
-    border-radius: 14px; padding: 10px; margin: 6px 4px;
-}
-.banner-art { font-family: monospace; font-size: 10px; color: #cc66ff; }
+.executing .card-body { color: #67e8f9; }
 
 .turn-header {
-    color: #6a5a7a; font-size: 10px; font-family: monospace;
-    letter-spacing: 2px; padding: 12px 8px 4px 8px;
+    color: #4b4266;
+    font-size: 10px;
+    font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
+    letter-spacing: 2px;
+    padding: 14px 8px 4px 8px;
+}
+.plain { background: transparent; border: none; box-shadow: none; padding: 4px 12px; }
+.plain .card-body {
+    color: #8b82a8;
+    font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
+    font-size: 12px;
 }
 
-.plain { background: transparent; border: none; padding: 4px 12px; }
-.plain .card-body { color: #b8a8c8; font-family: monospace; font-size: 12px; }
+/* ── banner art ─────────────────────────────────────────────────── */
+.banner {
+    background-image: linear-gradient(180deg, #120d24, #0a0716);
+    background-color: #0a0716;
+    border: 1px solid #3a2f5c;
+    border-radius: 14px;
+    padding: 12px;
+    margin: 6px 4px;
+    box-shadow: inset 0 0 30px rgba(124, 58, 237, 0.12);
+}
+.banner-art {
+    font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
+    font-size: 10px;
+    color: #c084fc;
+}
 
-.athena-sidebar { background: #0e0a18; }
+/* ── sidebar ────────────────────────────────────────────────────── */
+.athena-sidebar {
+    background-image: linear-gradient(180deg, #0d0a1a 0%, #0a0814 100%);
+    background-color: #0b0816;
+    border-right: 1px solid #1d1730;
+}
+.sidebar-search {
+    background-color: #14102a;
+    border: 1px solid #241d38;
+    border-radius: 10px;
+    color: #ece7f7;
+    margin: 10px 12px 2px 12px;
+    min-height: 38px;
+}
+.sidebar-search:focus { border-color: #a855f7; }
+.sidebar-brand {
+    color: #c084fc;
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 4px;
+    margin: 14px 18px 2px 18px;
+}
 .sidebar-header {
-    color: #6a5a7a; font-size: 10px; font-weight: 700;
-    letter-spacing: 1.5px; margin: 14px 16px 4px;
+    color: #5b5278;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.6px;
+    margin: 16px 18px 4px;
 }
 .sidebar-button {
-    padding: 12px 14px; border-radius: 10px; margin: 2px 8px;
-    color: #d8c8e8; min-height: 44px;
+    padding: 11px 14px;
+    border-radius: 10px;
+    margin: 1px 8px;
+    color: #cdc3e8;
+    min-height: 42px;
+    transition: background 120ms ease, color 120ms ease;
 }
-.sidebar-button:hover { background: #1f1530; }
+.sidebar-button:hover { background: #1a1330; color: #f5f2ff; }
+.sidebar-button:active, .sidebar-button:checked { background: #241640; }
+.sidebar-icon { font-size: 15px; }
+.sidebar-sep { min-height: 1px; background: #1d1730; margin: 10px 16px 4px 16px; }
 
+/* ── input bar ──────────────────────────────────────────────────── */
 .input-bar {
-    background: #15101f;
-    border-top: 1px solid #2a1a3a;
-    padding: 8px 10px 10px 10px;
+    background-image: linear-gradient(180deg, #120f22 0%, #0d0a18 100%);
+    background-color: #0f0c1d;
+    border-top: 1px solid #241d38;
+    padding: 10px 12px 12px 12px;
+    box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.4);
 }
 .input-entry {
-    background: #0a0612; color: #e6dcf0;
-    border: 1px solid #2a1a3a; border-radius: 22px;
-    padding: 10px 14px; font-size: 14px; min-height: 44px;
+    background-color: #08060f;
+    color: #ece7f7;
+    border: 1px solid #2c2444;
+    border-radius: 22px;
+    padding: 11px 16px;
+    font-size: 14px;
+    min-height: 46px;
 }
-.input-entry:focus { border-color: #cc66ff; }
+.input-entry:focus { border-color: #a855f7; box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.18); }
 .send-button {
-    background: #cc66ff; color: #0a0612;
-    border-radius: 22px; min-width: 44px; min-height: 44px;
-    font-weight: 700;
+    background-image: linear-gradient(180deg, #c084fc, #a855f7);
+    background-color: #a855f7;
+    color: #14091f;
+    border: none;
+    border-radius: 22px;
+    min-width: 46px;
+    min-height: 46px;
+    font-weight: 800;
+    box-shadow: 0 6px 18px rgba(168, 85, 247, 0.30);
 }
+.send-button:hover { background-image: linear-gradient(180deg, #d8b4fe, #b975f8); }
 .input-hint {
-    color: #6a5a7a; font-size: 10px; letter-spacing: 1.2px;
-    padding: 0 6px 4px;
+    color: #5b5278;
+    font-size: 10px;
+    letter-spacing: 1.2px;
+    padding: 0 8px 6px;
 }
 .rescue-row { margin-top: 6px; }
 .rescue-btn {
-    background: #2a1a3a; color: #ffcc88;
-    border-radius: 8px; padding: 6px 10px;
-    font-size: 11px; font-weight: 600;
+    background: #1a1330;
+    color: #fcd34d;
+    border: 1px solid #33265a;
+    border-radius: 9px;
+    padding: 7px 12px;
+    font-size: 11px;
+    font-weight: 700;
 }
-.rescue-btn:hover { background: #3a2a4a; }
+.rescue-btn:hover { background: #241640; }
 
-.wizard-title {
-    color: #cc66ff; font-size: 18px; font-weight: 700;
-    margin-bottom: 4px;
+/* ── settings dialog ────────────────────────────────────────────── */
+.sheet-title { color: #f5f2ff; font-size: 17px; font-weight: 800; letter-spacing: 0.3px; }
+.sheet-sub { color: #8b82a8; font-size: 12px; }
+.section-rule { min-height: 1px; background: #241d38; margin: 14px 0 4px 0; }
+.field-label {
+    color: #a78bfa;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.5px;
+    margin-top: 8px;
 }
-.wizard-sub   { color: #b8a8c8; font-size: 12px; margin-bottom: 12px; }
-.wizard-label {
-    color: #88aacc; font-size: 11px;
-    font-weight: 700; letter-spacing: 1.2px;
-    margin-top: 8px; margin-bottom: 2px;
+.toggle-row {
+    background: #14102a;
+    border: 1px solid #241d38;
+    border-radius: 11px;
+    padding: 9px 13px;
+    margin: 4px 0;
 }
-.wizard-entry {
-    background: #0a0612; color: #e6dcf0;
-    border: 1px solid #2a1a3a; border-radius: 8px;
-    padding: 8px 10px; font-size: 13px;
-    min-height: 36px;
+.toggle-title { color: #ece7f7; font-size: 13px; font-weight: 700; }
+.toggle-sub { color: #756c93; font-size: 11px; }
+.provider-row {
+    background-image: linear-gradient(180deg, #14102a, #110d21);
+    background-color: #130f24;
+    border: 1px solid #221a38;
+    border-left: 3px solid #4c2f7a;
+    border-radius: 11px;
+    padding: 9px 11px;
+    margin: 4px 0;
 }
+.provider-name { color: #ece7f7; font-size: 13px; font-weight: 700; }
+.model-count { color: #6ee7b7; font-size: 11px; }
+.badge-free {
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 1px;
+    background: #12301c;
+    color: #6ee59a;
+    border: 1px solid #1f5a34;
+}
+.badge-key {
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 1px;
+    background: #141830;
+    color: #9ab4ff;
+    border: 1px solid #263466;
+}
+.primary-btn {
+    background-image: linear-gradient(180deg, #c084fc, #a855f7);
+    background-color: #a855f7;
+    color: #14091f;
+    border: none;
+    border-radius: 11px;
+    padding: 11px 18px;
+    font-weight: 800;
+}
+.danger-btn {
+    background: #2e0f15;
+    color: #fda4af;
+    border: 1px solid #5a1b26;
+    border-radius: 11px;
+    padding: 9px 15px;
+    font-weight: 700;
+}
+.icon-btn {
+    background: transparent;
+    border: none;
+    color: #8b82a8;
+    border-radius: 8px;
+    padding: 4px;
+}
+.icon-btn:hover { background: #221a3a; color: #ece7f7; }
+
+/* ── misc widgets ───────────────────────────────────────────────── */
+scrollbar slider { background: #241d38; border-radius: 8px; min-width: 6px; min-height: 6px; }
+scrollbar slider:hover { background: #4c2f7a; }
+dropdown > button {
+    background-color: #14102a;
+    border: 1px solid #241d38;
+    border-radius: 9px;
+    color: #ece7f7;
+}
+spinbutton {
+    background-color: #14102a;
+    border: 1px solid #241d38;
+    border-radius: 9px;
+    color: #ece7f7;
+}
+popover > contents {
+    background-color: #16112a;
+    border: 1px solid #2c2444;
+    border-radius: 12px;
+}
+
 """
 
 
@@ -602,18 +985,38 @@ class WelcomeCard(Gtk.Box):
     def __init__(self, on_start: Callable[[], None]):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         card = _card("", "welcome")
-        t = Gtk.Label(label="Welcome back, Priest", xalign=0)
+
+        mark = Gtk.Label(label="◈  ATHENA  ·  v" + VERSION, xalign=0)
+        mark.add_css_class("welcome-mark")
+        card.append(mark)
+
+        t = Gtk.Label(label="Offensive security, on tap", xalign=0)
         t.add_css_class("welcome-title")
         card.append(t)
+
         s = Gtk.Label(
-            label="Tell me a target and what you want to do with it.  I'll "
-                  "plan it, run it, explain every move, and roast you when "
-                  "you screw up.",
+            label="Give me a target and an objective.  I'll pick the "
+                  "specialist, plan the path, and run every command through "
+                  "your y/n gate — explaining each move as we go.",
             xalign=0)
         s.set_wrap(True)
         s.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         s.add_css_class("welcome-sub")
         card.append(s)
+
+        chips = Gtk.FlowBox()
+        chips.set_selection_mode(Gtk.SelectionMode.NONE)
+        chips.set_column_spacing(6)
+        chips.set_row_spacing(6)
+        chips.set_max_children_per_line(4)
+        chips.add_css_class("welcome-chips")
+        for name in ("RECON", "WEB / API", "EXPLOITATION", "ACTIVE DIRECTORY",
+                     "PRIVESC", "REPORTING"):
+            c = Gtk.Label(label=name)
+            c.add_css_class("chip")
+            chips.append(c)
+        card.append(chips)
+
         btn = Gtk.Button(label="▶  Start New Engagement")
         btn.add_css_class("welcome-btn")
         btn.connect("clicked", lambda _b: on_start())
@@ -641,21 +1044,26 @@ class CommandCard(Gtk.Box):
         conf, attack, cmd_text = self._extract_meta(body)
         self._cmd_text = cmd_text
 
-        if conf or attack:
-            meta = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            meta.set_margin_bottom(4)
-            if conf:
-                p = Gtk.Label(label=conf.upper())
-                p.add_css_class("conf-pill")
-                p.add_css_class(f"conf-{conf.lower()}")
-                meta.append(p)
-            if attack:
-                p = Gtk.Label(label=attack)
-                p.add_css_class("attack-pill")
-                meta.append(p)
-            spacer = Gtk.Box(); spacer.set_hexpand(True)
-            meta.append(spacer)
-            card.append(meta)
+        meta = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        meta.set_margin_bottom(4)
+        if conf:
+            p = Gtk.Label(label=conf.upper())
+            p.add_css_class("conf-pill")
+            p.add_css_class(f"conf-{conf.lower()}")
+            meta.append(p)
+        if attack:
+            p = Gtk.Label(label=attack)
+            p.add_css_class("attack-pill")
+            meta.append(p)
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        meta.append(spacer)
+        copy_btn = Gtk.Button.new_from_icon_name("edit-copy-symbolic")
+        copy_btn.add_css_class("icon-btn")
+        copy_btn.set_tooltip_text("Copy command")
+        copy_btn.connect("clicked", lambda _b: self._copy_command())
+        meta.append(copy_btn)
+        card.append(meta)
 
         code = Gtk.Label(label=cmd_text, xalign=0)
         code.add_css_class("cmd-code")
@@ -689,6 +1097,18 @@ class CommandCard(Gtk.Box):
     @property
     def command(self) -> str:
         return self._cmd_text
+
+    def _copy_command(self) -> None:
+        try:
+            Gdk.Display.get_default().get_clipboard().set(self._cmd_text)
+        except Exception:
+            return
+        root = self.get_root()
+        if root is not None and hasattr(root, "toast"):
+            try:
+                root.toast("Command copied")
+            except Exception:
+                pass
 
     def _extract_meta(self, body: str):
         conf = None
@@ -1144,6 +1564,249 @@ class EngagementWizard:
 
 
 # ═════════════════════════════════════════════════════════════════════
+# SETTINGS DIALOG  (v7.8) — providers, keys, live models, feature toggles
+# ═════════════════════════════════════════════════════════════════════
+
+class SettingsDialog:
+    """Native control panel.  Writes the SAME ~/.athena/settings.json the CLI
+    reads, exports keys into the environment before Athena is (re)spawned, and
+    lists each provider's LIVE model catalogue on demand."""
+
+    def __init__(self, parent: Gtk.Window, on_saved: Callable[[], None]):
+        self._parent = parent
+        self._on_saved = on_saved
+        self._settings = load_settings()
+        self._rows = provider_rows()
+        self._entries: Dict[str, Gtk.PasswordEntry] = {}
+        self._notes: Dict[str, Gtk.Label] = {}
+        self._live: Dict[str, List[str]] = {}
+        self._toggles: Dict[str, Gtk.Switch] = {}
+        self._build_and_present()
+
+    # ── construction ──────────────────────────────────────────────
+    def _build_and_present(self) -> None:
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(500)
+        scroll.set_size_request(400, 540)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{m}")(8)
+        scroll.set_child(box)
+
+        t = Gtk.Label(label="Providers & models", xalign=0)
+        t.add_css_class("sheet-title")
+        s = Gtk.Label(
+            label="Paste a key for any provider (all free tiers welcome).  "
+                  "Keys are saved to ~/.athena/settings.json (chmod 600) and "
+                  "exported to Athena on launch.",
+            xalign=0)
+        s.set_wrap(True); s.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        s.add_css_class("sheet-sub")
+        box.append(t); box.append(s)
+
+        keys = self._settings.get("provider_keys") or {}
+        for row in self._rows:
+            p = row["provider"]
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            card.add_css_class("provider-row")
+
+            head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            name = Gtk.Label(label=row["label"], xalign=0)
+            name.add_css_class("provider-name"); name.set_hexpand(True)
+            head.append(name)
+            note = Gtk.Label(label=""); note.add_css_class("model-count")
+            self._notes[p] = note
+            head.append(note)
+            if row["free"]:
+                fb = Gtk.Label(label="FREE"); fb.add_css_class("badge-free")
+                head.append(fb)
+            card.append(head)
+
+            entry = Gtk.PasswordEntry()
+            entry.set_show_peek_icon(True)
+            entry.set_hexpand(True)
+            entry.add_css_class("wizard-entry")
+            entry.set_tooltip_text("paste API key")
+            env = row.get("env") or ""
+            entry.set_text(keys.get(p, "") or (os.environ.get(env, "") if env else ""))
+            self._entries[p] = entry
+            card.append(entry)
+
+            brow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            rbtn = Gtk.Button(label="List live models")
+            rbtn.connect("clicked", lambda _b, pp=p: self._refresh(pp))
+            brow.append(rbtn)
+            card.append(brow)
+            box.append(card)
+
+        # ── active model ──
+        rule = Gtk.Box(); rule.add_css_class("section-rule"); box.append(rule)
+        al = Gtk.Label(label="ACTIVE MODEL  (leave on auto for best available)",
+                       xalign=0); al.add_css_class("field-label")
+        box.append(al)
+        self._active_dd = Gtk.DropDown.new_from_strings(["(auto)"])
+        box.append(self._active_dd)
+
+        # ── generation ──
+        rule2 = Gtk.Box(); rule2.add_css_class("section-rule"); box.append(rule2)
+        gl = Gtk.Label(label="GENERATION", xalign=0); gl.add_css_class("field-label")
+        box.append(gl)
+
+        grow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        grow.append(Gtk.Label(label="Temperature", xalign=0))
+        self._temp = Gtk.SpinButton.new_with_range(0.0, 2.0, 0.05)
+        self._temp.set_value(float(self._settings.get("temperature", 0.2)))
+        self._temp.set_hexpand(True)
+        grow.append(self._temp)
+        box.append(grow)
+
+        grow2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        grow2.append(Gtk.Label(label="Max tokens", xalign=0))
+        self._max = Gtk.SpinButton.new_with_range(256, 32768, 256)
+        self._max.set_value(float(self._settings.get("max_tokens", 4096)))
+        self._max.set_hexpand(True)
+        grow2.append(self._max)
+        box.append(grow2)
+
+        # ── opt-in engines ──
+        rule3 = Gtk.Box(); rule3.add_css_class("section-rule"); box.append(rule3)
+        ol = Gtk.Label(label="OPT-IN ENGINES  (sensitive — off by default)",
+                       xalign=0); ol.add_css_class("field-label")
+        box.append(ol)
+        for feat, title, sub in (
+            ("skills_enabled", "Skills (sandboxed code)",
+             "Let Athena write & run helper scripts in the bubblewrap sandbox."),
+            ("mcp_enabled", "MCP servers",
+             "Connect stdio MCP servers from ~/.athena/mcp.json."),
+            ("reach_enabled", "Reach (semantic web/GitHub)",
+             "External search surface; output is webshield-sanitised."),
+        ):
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            row.add_css_class("toggle-row")
+            txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            txt.set_hexpand(True)
+            tt = Gtk.Label(label=title, xalign=0); tt.add_css_class("toggle-title")
+            st = Gtk.Label(label=sub, xalign=0); st.add_css_class("toggle-sub")
+            st.set_wrap(True); st.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            txt.append(tt); txt.append(st)
+            row.append(txt)
+            sw = Gtk.Switch()
+            sw.set_active(bool(self._settings.get(feat, False)))
+            sw.set_valign(Gtk.Align.CENTER)
+            self._toggles[feat] = sw
+            row.append(sw)
+            box.append(row)
+
+        # ── present ──
+        if hasattr(Adw, "AlertDialog"):
+            dlg = Adw.AlertDialog.new("Settings", "")
+            dlg.set_extra_child(scroll)
+            dlg.add_response("cancel", "Cancel")
+            dlg.add_response("save", "Save")
+            dlg.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+            dlg.set_default_response("save")
+            try:
+                dlg.set_content_width(420)
+            except Exception:
+                pass
+            dlg.connect("response", self._on_response)
+            dlg.present(self._parent)
+            self._dlg = dlg
+        else:
+            dlg = Adw.MessageDialog.new(self._parent, "Settings", "")
+            dlg.set_extra_child(scroll)
+            dlg.add_response("cancel", "Cancel")
+            dlg.add_response("save", "Save")
+            dlg.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+            dlg.set_default_response("save")
+            dlg.connect("response", self._on_response)
+            dlg.present()
+            self._dlg = dlg
+
+    # ── live model listing ────────────────────────────────────────
+    def _refresh(self, provider: str) -> None:
+        mod = load_providers_module()
+        if mod is None:
+            self._notes[provider].set_label("providers module missing")
+            return
+        key = self._entries[provider].get_text().strip()
+        self._settings.setdefault("provider_keys", {})[provider] = key
+        env = next((r.get("env") for r in self._rows
+                    if r["provider"] == provider), "")
+        if env and key:
+            os.environ[env] = key
+        self._notes[provider].set_label("loading…")
+
+        def work():
+            try:
+                got = mod.list_models(provider, timeout=8, use_cache=False,
+                                      settings=self._settings)
+                models = got.get("models") or []
+                err = got.get("error", "")
+            except Exception as e:  # noqa: BLE001
+                models, err = [], f"{type(e).__name__}: {e}"
+            GLib.idle_add(self._apply_models, provider, models, err)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_models(self, provider: str, models: List[str], err: str) -> bool:
+        if models:
+            self._live[provider] = models
+            self._notes[provider].set_label(f"{len(models)} live")
+            self._rebuild_active_dd()
+        else:
+            self._notes[provider].set_label(
+                ("no models" if not err else err[:40]))
+        return False
+
+    def _rebuild_active_dd(self) -> None:
+        opts = ["(auto)"]
+        for p, models in self._live.items():
+            for m in models[:25]:
+                opts.append(f"{p}/{m}")
+        self._active_dd.set_model(Gtk.StringList.new(opts))
+        cur = str(self._settings.get("active_model") or "")
+        for i, o in enumerate(opts):
+            if o == cur:
+                self._active_dd.set_selected(i)
+                break
+
+    # ── save ──────────────────────────────────────────────────────
+    def _on_response(self, _dlg, response: str) -> None:
+        if response != "save":
+            return
+        keys = dict(self._settings.get("provider_keys") or {})
+        enabled = dict(self._settings.get("provider_enabled") or {})
+        for row in self._rows:
+            p = row["provider"]
+            val = self._entries[p].get_text().strip()
+            if val:
+                keys[p] = val
+                env = row.get("env") or ""
+                if env:
+                    os.environ[env] = val
+            # Keyed providers: a saved key means enabled. Keyless/local
+            # providers (Ollama) are left to auto-detection, not forced off.
+            if row.get("env"):
+                enabled[p] = bool(val)
+            else:
+                enabled.pop(p, None)
+        self._settings["provider_keys"] = keys
+        self._settings["provider_enabled"] = enabled
+        for feat, sw in self._toggles.items():
+            self._settings[feat] = bool(sw.get_active())
+        self._settings["temperature"] = round(self._temp.get_value(), 2)
+        self._settings["max_tokens"] = int(self._max.get_value())
+        sel = self._active_dd.get_selected_item()
+        sel_txt = sel.get_string() if sel is not None else "(auto)"
+        self._settings["active_model"] = "" if sel_txt == "(auto)" else sel_txt
+        save_settings(self._settings)
+        if self._on_saved:
+            self._on_saved()
+
+
+# ═════════════════════════════════════════════════════════════════════
 # MAIN WINDOW
 # ═════════════════════════════════════════════════════════════════════
 
@@ -1151,26 +1814,43 @@ class AthenaWindow(Adw.ApplicationWindow):
     def __init__(self, application: Adw.Application):
         super().__init__(application=application)
         self.set_title("Athena")
-        self.set_default_size(420, 820)
+        self.set_default_size(460, 880)
+        self.set_size_request(360, 560)
 
         cfg = Config.load()
         key = cfg.get("groq_api_key", "")
         if key and not os.environ.get("GROQ_API_KEY"):
             os.environ["GROQ_API_KEY"] = key
+        # v7.8 — export every provider key from the shared settings file so a
+        # key saved in the GUI (or by the CLI) reaches the spawned agent.
+        try:
+            _s = load_settings()
+            _envs = {r["provider"]: r.get("env") for r in provider_rows()}
+            for _p, _k in (_s.get("provider_keys") or {}).items():
+                _env = _envs.get(_p) or ""
+                if _env and _k and not os.environ.get(_env):
+                    os.environ[_env] = str(_k)
+        except Exception:
+            pass
 
         self._process: Optional[AthenaProcess] = None
         self._pending_inputs: List[str] = []
         self._wizard_open = False
         self._target_pill: Optional[Gtk.Label] = None
         self._agent_pill: Optional[Gtk.Label] = None
+        self._activity_dot: Optional[Gtk.Box] = None
+        self._sidebar_entries: List[Any] = []
 
         self.split = Adw.OverlaySplitView()
         self.split.set_collapsed(True)
         self.split.set_show_sidebar(False)
-        self.split.set_max_sidebar_width(280)
-        self.split.set_sidebar_width_fraction(0.7)
-        self.set_content(self.split)
+        self.split.set_max_sidebar_width(292)
+        self.split.set_sidebar_width_fraction(0.72)
         self.split.set_sidebar(self._build_sidebar())
+
+        self.toast_overlay = Adw.ToastOverlay()
+        self.toast_overlay.set_child(self.split)
+        self.set_content(self.toast_overlay)
 
         toolbar = Adw.ToolbarView()
         toolbar.add_top_bar(self._build_header())
@@ -1255,22 +1935,42 @@ class AthenaWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._open_wizard)
 
     def _on_process_event(self, _proc, ev: dict) -> None:
-        if ev.get("type") == "status":
+        t = ev.get("type")
+        if t == "status":
             self._update_status_pills(ev["text"])
             return
 
         # Auto-feed startup prompts from the wizard
-        if ev.get("type") == "prompt_text" and self._pending_inputs:
+        if t == "prompt_text" and self._pending_inputs:
             text = self._pending_inputs.pop(0)
             self._process.writeln(text)
             self._input.set_mode("text")
             return
+
+        # Status-dot activity
+        if t == "panel":
+            kind = classify_panel_title(ev.get("title", ""))
+            if kind == "thought":
+                self._set_activity("thinking")
+            elif kind in ("executing", "dispatch"):
+                self._set_activity("executing")
+            elif kind == "command":
+                self._set_activity("await")
+            elif kind == "error":
+                self._set_activity("idle")
+        elif t == "prompt_ynq":
+            self._set_activity("await")
+        elif t in ("prompt_text", "prompt_password"):
+            self._set_activity("idle")
+        elif t == "fatal":
+            self._set_activity("idle")
 
         mode = self._conversation.handle_event(ev)
         if mode is not None:
             self._input.set_mode(mode)
 
     def _on_process_exited(self, _proc) -> None:
+        self._set_activity("idle")
         self._conversation.append(PlainCard("── session ended — tap ↻ to start again ──"))
 
     def _update_status_pills(self, text: str) -> None:
@@ -1279,16 +1979,38 @@ class AthenaWindow(Adw.ApplicationWindow):
             self._target_pill.set_label(parts[0] or "no target")
             self._agent_pill.set_label(parts[1] or "·")
 
+    def toast(self, message: str) -> None:
+        """Transient feedback in the corner — never blocks the feed."""
+        try:
+            self.toast_overlay.add_toast(Adw.Toast.new(message))
+        except Exception:
+            pass
+
+    def _set_activity(self, state: str) -> None:
+        """Drive the header status dot: idle · thinking · executing · await."""
+        if self._activity_dot is None:
+            return
+        for c in ("st-idle", "st-thinking", "st-executing", "st-await", "st-done"):
+            self._activity_dot.remove_css_class(c)
+        self._activity_dot.add_css_class("st-" + state)
+
     def _on_send_text(self, text: str) -> None:
         if self._process is None:
             self._pending_inputs.append(text)
             self._start_athena()
             return
+        self._set_activity("thinking")
         self._process.writeln(text)
 
     def _on_decision(self, value: str) -> None:
         if self._process is None:
             return
+        if value == "y":
+            self._set_activity("executing")
+        elif value == "n":
+            self._set_activity("thinking")
+        else:
+            self._set_activity("idle")
         self._process.writeln(value)
 
     def _on_rescue(self) -> None:
@@ -1304,9 +2026,25 @@ class AthenaWindow(Adw.ApplicationWindow):
 
     def _build_header(self) -> Adw.HeaderBar:
         header = Adw.HeaderBar()
-        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        t1 = Gtk.Label(label="ATHENA"); t1.add_css_class("title")
-        title_box.append(t1)
+        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        title_box.set_valign(Gtk.Align.CENTER)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.set_halign(Gtk.Align.CENTER)
+        self._activity_dot = Gtk.Box()
+        self._activity_dot.add_css_class("status-dot")
+        self._activity_dot.add_css_class("st-idle")
+        self._activity_dot.set_valign(Gtk.Align.CENTER)
+        row.append(self._activity_dot)
+        t1 = Gtk.Label(label="ATHENA")
+        t1.add_css_class("app-title")
+        row.append(t1)
+        ver = Gtk.Label(label="v" + VERSION)
+        ver.add_css_class("version-pill")
+        ver.set_valign(Gtk.Align.CENTER)
+        row.append(ver)
+        title_box.append(row)
+
         pills = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         pills.set_halign(Gtk.Align.CENTER)
         self._target_pill = Gtk.Label(label="no target")
@@ -1319,7 +2057,8 @@ class AthenaWindow(Adw.ApplicationWindow):
         title_box.append(pills)
         header.set_title_widget(title_box)
 
-        sidebar_btn = Gtk.Button.new_from_icon_name("view-sidebar-start-symbolic")
+        sidebar_btn = Gtk.Button.new_from_icon_name("view-list-symbolic")
+        sidebar_btn.set_tooltip_text("Commands")
         sidebar_btn.connect(
             "clicked",
             lambda _b: self.split.set_show_sidebar(not self.split.get_show_sidebar()),
@@ -1334,9 +2073,11 @@ class AthenaWindow(Adw.ApplicationWindow):
         more = Gtk.MenuButton()
         more.set_icon_name("open-menu-symbolic")
         menu = Gio.Menu.new()
+        menu.append("New engagement", "win.new-engagement")
         menu.append("Restart session", "win.restart")
-        menu.append("Open logs folder", "win.open-logs")
+        menu.append("Settings…", "win.settings")
         menu.append("API key…", "win.api-key")
+        menu.append("Open logs folder", "win.open-logs")
         menu.append("About", "win.about")
         more.set_menu_model(menu)
         header.pack_end(more)
@@ -1352,7 +2093,18 @@ class AthenaWindow(Adw.ApplicationWindow):
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        box.set_margin_top(4); box.set_margin_bottom(12)
+        box.set_margin_top(2)
+        box.set_margin_bottom(16)
+
+        brand = Gtk.Label(label="◈  ATHENA", xalign=0)
+        brand.add_css_class("sidebar-brand")
+        box.append(brand)
+
+        self._sidebar_search = Gtk.SearchEntry()
+        self._sidebar_search.add_css_class("sidebar-search")
+        self._sidebar_search.set_placeholder_text("Filter commands…")
+        self._sidebar_search.connect("search-changed", self._filter_sidebar)
+        box.append(self._sidebar_search)
 
         sections = [
             ("ENGAGEMENT", [
@@ -1370,6 +2122,9 @@ class AthenaWindow(Adw.ApplicationWindow):
                 ("🛡", "Scope / RoE",  "scope"),
                 ("🔧", "Tools",         "tools"),
                 ("🤖", "Model Chain",   "model"),
+                ("🔌", "Providers",    "model providers"),
+                ("🧠", "Engines",      "engines"),
+                ("⚙", "Settings",     "settings"),
                 ("👥", "Agents",        "agents"),
             ]),
             ("SESSION", [
@@ -1384,20 +2139,38 @@ class AthenaWindow(Adw.ApplicationWindow):
             h = Gtk.Label(label=header_text, xalign=0)
             h.add_css_class("sidebar-header")
             box.append(h)
+            group = []
             for icon, label, cmd in items:
-                box.append(self._sidebar_button(icon, label, cmd))
+                btn = self._sidebar_button(icon, label, cmd)
+                group.append(btn)
+                box.append(btn)
+            self._sidebar_entries.append((h, group))
 
         scroll.set_child(box)
         page.set_child(scroll)
         return page
 
+    def _filter_sidebar(self, entry: Gtk.SearchEntry) -> None:
+        q = entry.get_text().strip().lower()
+        for header, buttons in self._sidebar_entries:
+            any_visible = False
+            for btn in buttons:
+                visible = (not q) or (q in getattr(btn, "_search_text", ""))
+                btn.set_visible(visible)
+                any_visible = any_visible or visible
+            header.set_visible(any_visible)
+
     def _sidebar_button(self, icon: str, label: str, cmd: str) -> Gtk.Button:
         b = Gtk.Button()
         b.add_css_class("flat")
         b.add_css_class("sidebar-button")
+        b._search_text = f"{icon} {label} {cmd}".lower()
         inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
-        inner.append(Gtk.Label(label=icon))
-        l = Gtk.Label(label=label, xalign=0); l.set_hexpand(True)
+        ic = Gtk.Label(label=icon)
+        ic.add_css_class("sidebar-icon")
+        inner.append(ic)
+        l = Gtk.Label(label=label, xalign=0)
+        l.set_hexpand(True)
         inner.append(l)
         b.set_child(inner)
         b.connect("clicked", lambda _x, c=cmd: self._send_command(c, close=True))
@@ -1417,6 +2190,7 @@ class AthenaWindow(Adw.ApplicationWindow):
             ("new-engagement", self._action_new_engagement),
             ("open-logs",      self._action_open_logs),
             ("api-key",        self._action_api_key),
+            ("settings",       self._action_settings),
             ("about",          self._action_about),
         ]:
             act = Gio.SimpleAction.new(name, None)
@@ -1444,6 +2218,15 @@ class AthenaWindow(Adw.ApplicationWindow):
 
     def _action_api_key(self, *_):
         self._show_api_key_dialog(then_open_wizard=False)
+
+    def _action_settings(self, *_):
+        SettingsDialog(parent=self, on_saved=self._on_settings_saved)
+
+    def _on_settings_saved(self):
+        self._conversation.append(PlainCard(
+            "── Settings saved — tap ↻ (Restart session) to apply to the "
+            "running agent ──"))
+        self.toast("Settings saved")
 
     def _action_about(self, *_):
         if hasattr(Adw, "AboutDialog"):

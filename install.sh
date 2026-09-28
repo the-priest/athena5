@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║              ATHENA INSTALLER — v7.3 (GUI + CLI)                 ║
+# ║              ATHENA INSTALLER — v7.8 (GUI + CLI)                 ║
 # ║   Smart install: detects what's missing, installs only that.     ║
+# ║   Ships the WHOLE athena_ext/ engine package (recursive copy),   ║
+# ║   the smoke test and GUI screenshots, then self-checks the lot.  ║
 # ║   Sets up both the CLI shortcut and the Phosh app icon.          ║
 # ╚══════════════════════════════════════════════════════════════════╝
 #
@@ -52,7 +54,7 @@ ${MAG}
   ██╔══██║   ██║   ██╔══██║██╔══╝  ██║╚██╗██║██╔══██║
   ██║  ██║   ██║   ██║  ██║███████╗██║ ╚████║██║  ██║
   ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝${DIM}
-                 v7.3 · GUI + CLI installer${RST}
+                 v7.8 · GUI + CLI installer${RST}
 
 EOF
 fi
@@ -229,19 +231,63 @@ for f in athena.py athena_gui.py athena-gui requirements.txt README.md; do
     fi
 done
 
-# v7.4 — ship the athena_ext package (persistent memory, oracle, zdayfind,
-# codescan, headroom, foresight, sandbox).  Whole-dir copy so a newly added
-# module never gets silently dropped from a hand-maintained file list.
+# v7.8 — ship the ENTIRE athena_ext package.  This is a whole-directory
+# recursive copy (never a hand-maintained file list) so a newly added engine is
+# never silently dropped.  The destination is wiped first so a removed or
+# renamed module can't linger and shadow the new one.
 if [[ -d "$SRC_DIR/athena_ext" ]]; then
     rm -rf "$INSTALL_DIR/athena_ext"
     cp -rf "$SRC_DIR/athena_ext" "$INSTALL_DIR/athena_ext"
-    rm -rf "$INSTALL_DIR/athena_ext/__pycache__" 2>/dev/null || true
-    ok "athena_ext copied ($(ls "$INSTALL_DIR/athena_ext"/*.py 2>/dev/null | wc -l) modules)"
+    # Drop bytecode caches recursively — they're host/arch/python specific.
+    find "$INSTALL_DIR/athena_ext" -type d -name __pycache__ -prune \
+        -exec rm -rf {} + 2>/dev/null || true
+    find "$INSTALL_DIR/athena_ext" -type f \( -name '*.pyc' -o -name '*.pyo' \) \
+        -delete 2>/dev/null || true
+
+    src_n=$(find "$SRC_DIR/athena_ext" -maxdepth 1 -name '*.py' | wc -l)
+    dst_n=$(find "$INSTALL_DIR/athena_ext" -maxdepth 1 -name '*.py' | wc -l)
+    if [[ "$dst_n" -gt 0 && "$src_n" == "$dst_n" ]]; then
+        ok "athena_ext copied — $dst_n modules (full directory, recursion included)"
+    else
+        warn "athena_ext module count mismatch (source $src_n vs installed $dst_n)"
+    fi
 else
     warn "athena_ext/ not found in source — smart subsystems will be disabled"
 fi
+
+# v7.8 — ship the smoke test so an install can be self-checked offline.
+if [[ -d "$SRC_DIR/tests" ]]; then
+    rm -rf "$INSTALL_DIR/tests"
+    cp -rf "$SRC_DIR/tests" "$INSTALL_DIR/tests"
+    rm -rf "$INSTALL_DIR/tests/__pycache__" 2>/dev/null || true
+fi
+
+# v7.8 — ship the README's GUI screenshots so image links resolve.
+if [[ -d "$SRC_DIR/docs" ]]; then
+    rm -rf "$INSTALL_DIR/docs"
+    cp -rf "$SRC_DIR/docs" "$INSTALL_DIR/docs"
+fi
 chmod +x "$INSTALL_DIR/athena.py" "$INSTALL_DIR/athena-gui" 2>/dev/null || true
 ok "files copied"
+
+# ── 4b. verify the copied install actually works ───────────────────
+step "Verify install"
+if [[ -f "$INSTALL_DIR/tests/smoke.py" ]] && has python3; then
+    SMOKE_LOG="/tmp/athena_smoke_$$.log"
+    if ( cd "$INSTALL_DIR" && python3 "$INSTALL_DIR/tests/smoke.py" ) >"$SMOKE_LOG" 2>&1; then
+        SMOKE_SUM="$(grep -oE '[0-9]+ passed, [0-9]+ failed' "$SMOKE_LOG" | tail -1)"
+        ok "self-check passed${SMOKE_SUM:+ — $SMOKE_SUM}"
+        rm -f "$SMOKE_LOG"
+    else
+        warn "self-check reported problems — see $SMOKE_LOG"
+    fi
+else
+    if ( cd "$INSTALL_DIR" && python3 -c 'import athena_ext' ) >/dev/null 2>&1; then
+        ok "athena_ext imports cleanly"
+    else
+        warn "athena_ext failed to import from $INSTALL_DIR"
+    fi
+fi
 
 # ── 5. ~/.athena dirs ──────────────────────────────────────────────
 mkdir -p "$DATA_DIR/logs"
@@ -318,7 +364,7 @@ if [[ -z "${GROQ_API_KEY:-}" && $KEY_IN_RC == 0 ]]; then
     if [[ -t 0 ]]; then
         warn "GROQ_API_KEY not set"
         say "    Free key (no card): https://console.groq.com"
-        read -r -p "    Paste key (or Enter to skip and set later in the GUI): " key
+        read -r -p "    Paste key (or Enter to skip and set later in the GUI): " key || true
         if [[ -n "${key:-}" ]]; then
             for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
                 [[ -f "$rc" ]] || continue
@@ -345,7 +391,7 @@ if [[ -z "${SILICONFLOW_API_KEY:-}" && $SF_IN_RC == 0 ]]; then
     if [[ -t 0 ]]; then
         say "    Optional: adds Kimi/GLM/Qwen/DeepSeek to the fallback chain."
         say "    Free key: https://cloud.siliconflow.com/account/ak"
-        read -r -p "    Paste SiliconFlow key (or Enter to skip): " sfkey
+        read -r -p "    Paste SiliconFlow key (or Enter to skip): " sfkey || true
         if [[ -n "${sfkey:-}" ]]; then
             for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
                 [[ -f "$rc" ]] || continue

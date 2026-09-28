@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║           ATHENA — AI Offensive Security Agent v7.3              ║
+║           ATHENA — AI Offensive Security Agent v7.8              ║
 ║   Bare-metal Kali NetHunter  ·  Commander: The Priest             ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
-║   v7.3 — TOKEN SAVINGS + BUG FIXES                               ║
+║   v7.8 — MULTI-PROVIDER + LIVE MODELS + CONTROL PANEL            ║
 ║                                                                  ║
-║   FIXES: provider chain stripped of 404-ing models,             ║
-║   instance vars properly initialized, output compression         ║
-║   improved, KB sections capped, tools block gated.               ║
+║   • any OpenAI-compatible provider is a chain link: Groq,        ║
+║     SiliconFlow, OpenRouter, Cerebras, Together, Mistral,        ║
+║     DeepSeek, Gemini, xAI, OpenAI, Hyperbolic, local Ollama      ║
+║   • models are discovered LIVE from each provider (no more       ║
+║     404-ing hard-coded ids); ranked so the head is a real model  ║
+║   • `settings` control panel, `key` to add providers, `model` to  ║
+║     list/refresh/pin the chain — CLI and the GTK GUI share it     ║
+║   • 25 smart athena_ext engines bridged as pure tools            ║
+║   • operator still confirms every command: y / n / q             ║
 ║                                                                  ║
-║   PRESERVED FROM v7.2: PTT, 11 specialist agents, 28+ tools,    ║
-║   MITRE ATT&CK, scope/RoE, attack graph, Groq chain.            ║
+║   PRESERVED: PTT, 11 specialist agents, MITRE ATT&CK, scope/RoE,  ║
+║   attack graph, the y/n execution gate.                          ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -63,7 +69,7 @@ except ImportError:
 # VERSION & PROVIDER CHAIN  (Groq + optional SiliconFlow, biggest→smallest)
 # ═════════════════════════════════════════════════════════════════════
 
-VERSION = "7.7"
+VERSION = "7.8"
 
 # v7.3 — CHEAP-FIRST chain, verified Groq models only.
 # openai/gpt-oss-* and allam-2-7b were 404-ing constantly and burning
@@ -112,8 +118,25 @@ ORACLE_DIR  = os.path.join(INSTALL_DIR, "oracle")        # v7.4 — verified-exp
 # ── v7.4 — "smart" subsystems ported from Basilisk (athena_ext/) ──────
 # Imported lazily and fail-soft: a missing or broken ext module must never
 # stop the agent from booting.  _ext("memory") returns the module or None.
+#
+# v7.8 — the full Basilisk brain transplant.  The list below is the single
+# source of truth for status/dashboard views; it grows with the engines added
+# in v7.8 (exploits · pentest · workspace · verify · research · tasks ·
+# browser · juiceshop · xbow · bench · skills · mcp · reach · bridge).
 _EXT_CACHE: Dict[str, Any] = {}
 _EXT_FAILED: Dict[str, str] = {}
+EXT_MODULES = (
+    # v7.4/7.5 core
+    "memory", "oracle", "zdayfind", "codescan", "headroom", "foresight",
+    "sandbox", "webshield", "engage", "recall", "unblock",
+    # v7.8 — Basilisk-grade engines
+    "exploits", "pentest", "workspace", "verify", "research", "tasks",
+    "browser", "juiceshop", "xbow", "bench", "skills", "mcp", "reach",
+    # v7.8 — operator control panel + multi-provider live model discovery
+    "settings", "providers",
+    # v7.8 — the in-process tool bridge over all of the above
+    "bridge",
+)
 
 def _ext(name: str):
     """Lazy import of an athena_ext submodule; returns the module or None.
@@ -134,9 +157,7 @@ def _ext(name: str):
 def ext_status() -> Dict[str, str]:
     """Report which smart modules loaded, for the `tools`/dashboard views."""
     out = {}
-    for n in ("memory", "oracle", "zdayfind", "codescan",
-              "headroom", "foresight", "sandbox", "webshield",
-              "engage", "recall", "unblock"):
+    for n in EXT_MODULES:
         if n in _EXT_CACHE:
             out[n] = "loaded"
         elif n in _EXT_FAILED:
@@ -2534,8 +2555,11 @@ def boot_sequence_lines() -> List[str]:
         f"\033[90m   [boot]\033[0m \033[32m✓\033[0m  loading {len(MITRE_TECHNIQUES)} ATT&CK technique mappings",
         f"\033[90m   [boot]\033[0m {graph_glyph}  attack graph: {graph_msg}",
         "\033[90m   [boot]\033[0m \033[32m✓\033[0m  smart-context manager online",
+        (f"\033[90m   [boot]\033[0m \033[32m✓\033[0m  "
+         f"{len(_athena_bridge.REGISTRY) if _athena_bridge else 0} "
+         f"smart engines online"),
         "\033[90m   [boot]\033[0m \033[32m✓\033[0m  loop-breaker + sudo-retry armed",
-        "\033[90m   [boot]\033[0m \033[32m✓\033[0m  Groq provider chain primed",
+        "\033[90m   [boot]\033[0m \033[32m✓\033[0m  multi-provider chain primed",
     ]
 
 
@@ -3405,6 +3429,21 @@ PURE_TOOL_DISPATCH = {
     "graph_query":       _pt_graph_query,
 }
 
+# ── v7.8 — Basilisk-grade engines (athena_ext/bridge.py) ──────────────
+# The bridge exposes the ported exploitation / recon / workspace / research /
+# scoring engines as in-process tools through the SAME fn(session, args) -> str
+# contract and the SAME [TOOL] syntax.  Merged into the dispatch here so the
+# intercept in think_turn needs no change at all.  Fail-soft: a broken bridge
+# just means these extra tools are absent, never a boot failure.
+try:
+    from athena_ext import bridge as _athena_bridge
+    PURE_TOOL_DISPATCH.update(_athena_bridge.REGISTRY)
+    _BRIDGE_SPEC = _athena_bridge.SPEC
+except Exception as _e:                       # pragma: no cover - env-dependent
+    _athena_bridge = None
+    _BRIDGE_SPEC = ""
+    print(f"\033[33m   bridge unavailable ({_e}) — Basilisk engines disabled\033[0m")
+
 # Compact spec shown to the model (gated to turns 1-2 like the shell registry).
 PURE_TOOL_SPEC = (
     "IN-PROCESS TOOLS (same [TOOL]name[/TOOL][ARGS]json[/ARGS] syntax; these "
@@ -3438,7 +3477,7 @@ PURE_TOOL_SPEC = (
     "\"...\"}[/ARGS] — read the asset graph back to reason over the whole job.\n"
     "Discipline: arm -> exploit -> check. Don't claim success the oracle "
     "hasn't confirmed."
-)
+) + (("\n" + _BRIDGE_SPEC) if _BRIDGE_SPEC else "")
 
 
 def run_pure_tool(session, name: str, args_json: str) -> Tuple[Optional[str], Optional[str]]:
@@ -4279,7 +4318,7 @@ MENTOR_PERSONA = (
 # her sibling tool Basilisk.  Compact + gated to the first turns (or [NEED]tools)
 # to protect the token budget.
 ATHENA_SELF = (
-    "── WHO YOU ARE (v7.4 self-knowledge) ──\n"
+    "── WHO YOU ARE (v7.8 self-knowledge) ──\n"
     "You are Athena, an AI offensive-security COPILOT built by The Priest "
     "(github.com/the-priest/athena5). You are the confirmation-gated one: you "
     "plan and pick tools, but the operator drives — every shell command passes "
@@ -4297,6 +4336,38 @@ ATHENA_SELF = (
     " • CODESCAN — SAST/SCA/secrets scan planning (codescan_plan).\n"
     " • FORESIGHT — destructive-op risk cards shown before the gate.\n"
     "These run instantly inside you, no shell, no gate (read-only/analysis).\n"
+    "v7.8 completes the transplant — every useful engine from Basilisk now runs "
+    "inside you as an in-process tool (they BUILD/ANALYSE/VERIFY; you still run "
+    "each attack yourself through the gate):\n"
+    " • EXPLOITS (exploit_list, exploit_build) — 50+ payload/request builders: "
+    "JWT forge & crack, NoSQL, SSTI, XXE, SSRF, deserialisation, prototype "
+    "pollution, SQLi, XSS, command injection, IDOR, race, upload-bypass, "
+    "GraphQL, OAuth/SAML, CSRF, and more. Build the EXACT payload for the stack.\n"
+    " • PENTEST (pentest_plan, parse_output, cve_lookup, enrich_cves, "
+    "methodology, cheatsheet, nuclei_template, sqlmap_plan, webapp_paths, "
+    "wordlist_find, reflect_findings, report_findings, attack_writeup) — recon "
+    "plans, scanner-output parsing, NVD+KEV/EPSS enrichment, and writeups.\n"
+    " • WORKSPACE (workspace) — import a repo (zip/dir) into a CONFINED copy and "
+    "read/search/edit/diff/revert/test it; source review without touching the "
+    "real tree.\n"
+    " • RESEARCH/VERIFY (research_search, research_run, verify_claim, "
+    "browser_fetch, browser_status) — multi-engine OSINT ranked by source "
+    "agreement, multi-source fact verification with confidence, real-browser "
+    "rendering.\n"
+    " • TASKS (task_plan, task_status, task_update, task_render) — a live plan "
+    "you keep honest against.\n"
+    " • SCORING (juiceshop_*, xbow_*, bench_*) — objective scoring of a run.\n"
+    " • OPT-IN (OFF by default): skill_* (agent-written scripts in the "
+    "bubblewrap sandbox), mcp_* (stdio MCP servers), reach (semantic web/GitHub "
+    "search). Enable them with ATHENA_SKILLS=1 / ATHENA_MCP=1 / ATHENA_REACH=1, "
+    "or the operator toggles them in `settings`/the GUI (settings.json).\n"
+    "Call any of them with the same [TOOL]name[/TOOL][ARGS]json[/ARGS] syntax; "
+    "[NEED]tools[/NEED] re-attaches the full engine spec.\n"
+    "PROVIDER CONTROL (v7.8) — you run on a live multi-provider fallback chain "
+    "(Groq, SiliconFlow, OpenRouter, Cerebras, Together, Mistral, DeepSeek, "
+    "Gemini, xAI, OpenAI, Hyperbolic, local Ollama). Models are discovered live "
+    "per key. The operator manages it with `model` (list/refresh/providers/use), "
+    "`key <provider> <api_key>`, and `settings`.\n"
     "Your dangerous cousin is BASILISK (github.com/the-priest/Basilisk) — same "
     "bloodline, no leash: fully autonomous, no y/n gate, an 'Unleash' mode that "
     "does not stop until the mission is done. If the operator wants hands-off "
@@ -4346,7 +4417,13 @@ CORE_RULES = (
     "   shell, GUI tool, listener setup), drop the [CMD] and emit\n"
     "   [MANUAL]<numbered steps>[/MANUAL] instead.\n"
     " - If operator types 'stuck'/'help'/'idk'/'wtf', skip [CMD] and emit\n"
-    "   [MANUAL] with 3-5 concrete next moves."
+    "   [MANUAL] with 3-5 concrete next moves.\n"
+    " - ELITE LOOP (host/web/API): recon -> understand -> build the EXACT "
+    "payload -> run it behind the gate -> PROVE it with the oracle -> record. "
+    "Reach for exploit_build (payloads), pentest_plan/parse_output/cve_lookup "
+    "(recon), workspace (source), research_search/verify_claim (unknowns), "
+    "reflect_findings/attack_writeup (report). [NEED]tools[/NEED] re-attaches "
+    "the full engine spec."
 )
 
 
@@ -4692,6 +4769,23 @@ class AthenaSession:
                 say_warn(f"memory disabled: {e}")
                 self.mem = None
 
+        # v7.8 — point the confined code workspace at ~/.athena/workspaces, and
+        # give the optional MCP client the SAME catastrophic-command floor
+        # Athena applies to her own `run` (so an untrusted MCP server's
+        # arguments cannot smuggle a `rm -rf /` past us).
+        _ws = _ext("workspace")
+        if _ws is not None:
+            try:
+                _ws.configure(INSTALL_DIR)
+            except Exception:
+                pass
+        _mcp = _ext("mcp")
+        if _mcp is not None:
+            try:
+                _mcp.bind_safety(lambda c: self._is_destructive(c))
+            except Exception:
+                pass
+
         # v7.1 — credential fanout queue (creds awaiting service tests)
         self.cred_fanout_queue: List[Tuple[str, str]] = []  # (cred_value, user)
 
@@ -4701,6 +4795,17 @@ class AthenaSession:
         # Provider state
         self.provider_index = 0
         self.groq_client: Optional[Groq] = None
+        # v7.8 — multi-provider.  self.clients maps provider -> OpenAI-compatible
+        # client; self.chain is the live fallback chain rebuilt at init/refresh.
+        self.clients: Dict[str, Any] = {}
+        self.chain: List[Tuple[str, str, str]] = list(PROVIDER_CHAIN)
+        self.settings: Dict[str, Any] = {}
+        try:
+            _s = _ext("settings")
+            if _s is not None:
+                self.settings = _s.load()
+        except Exception:
+            self.settings = {}
 
         # v7.3 — properly initialize all instance state that was previously
         # scattered as class vars or lazy getattr hacks.
@@ -4738,44 +4843,108 @@ class AthenaSession:
                or self.target_info.get("domain") or "default")
         return re.sub(r"[^A-Za-z0-9._-]+", "_", str(tgt)) or "default"
 
+    def _provider_order(self) -> List[str]:
+        """Enabled providers, in preference order."""
+        provs = _ext("providers")
+        if provs is None:
+            return []
+        return [p for p in provs.ORDER if provs.is_enabled(p, self.settings)]
+
+    def _make_clients(self) -> Dict[str, Any]:
+        """One OpenAI-compatible client per enabled provider.
+
+        The Groq SDK is OpenAI-compatible and takes a base_url, so we reuse it
+        for every provider instead of adding an `openai`/`requests` dependency.
+        A provider whose client fails to construct is simply dropped."""
+        provs = _ext("providers")
+        clients: Dict[str, Any] = {}
+        if provs is None:
+            return clients
+        for p in self._provider_order():
+            try:
+                clients[p] = provs.make_client(p, self.settings)
+            except Exception as e:
+                print(f"\033[33m   {p} client init failed ({str(e)[:50]})\033[0m")
+        return clients
+
+    def _rebuild_chain(self, live: bool = False, quiet: bool = False) -> None:
+        """(Re)build self.chain from settings + live discovery.  Fail-soft."""
+        provs = _ext("providers")
+        chain: Optional[List[Tuple[str, str, str]]] = None
+        if provs is not None:
+            try:
+                chain = provs.build_chain(
+                    self.settings, live=live,
+                    max_len=int(self.settings.get("max_chain", 12)))
+            except Exception:
+                chain = None
+        if not chain:
+            chain = list(PROVIDER_CHAIN)
+            if not quiet:
+                say_warn("provider discovery returned nothing — using static chain")
+        # Honour a pinned active model ("provider/model-id").
+        active = str(self.settings.get("active_model") or "")
+        idx: Optional[int] = None
+        if active and "/" in active:
+            ap, am = active.split("/", 1)
+            idx = next((i for i, (mid, _n, p) in enumerate(chain)
+                        if p == ap and mid == am), None)
+            if idx is None and ap in self.clients:
+                disp = provs._display(am) if provs is not None else am
+                chain.insert(0, (am, disp, ap))
+                idx = 0
+        self.provider_index = idx if idx is not None else 0
+        self.chain = chain
+
     def _init_provider(self):
-        groq_key = os.environ.get("GROQ_API_KEY")
-        if not groq_key:
+        provs = _ext("providers")
+
+        # ── legacy path: no providers module (should not happen in v7.8) ──
+        if provs is None:
+            groq_key = os.environ.get("GROQ_API_KEY")
+            if not groq_key:
+                print("\n\033[31m   FATAL: GROQ_API_KEY not set.\033[0m\n"
+                      "   export GROQ_API_KEY='your_key'\n")
+                sys.exit(1)
+            self.groq_client = Groq(api_key=groq_key)
+            self.clients = {"groq": self.groq_client}
+            self.chain = list(PROVIDER_CHAIN)
+            return
+
+        # refresh settings (the GUI or `key` command may have changed them)
+        _s = _ext("settings")
+        if _s is not None:
+            self.settings = _s.load()
+
+        self.clients = self._make_clients()
+        if not self.clients:
             print(
-                "\n\033[31m   FATAL: GROQ_API_KEY not set.\033[0m\n"
-                "   Add to ~/.bashrc:  export GROQ_API_KEY='your_key'\n"
-                "   Then: source ~/.bashrc\n"
+                "\n\033[31m   FATAL: no LLM provider configured.\033[0m\n"
+                "   Set a key for at least one provider, e.g.:\n"
+                "     export GROQ_API_KEY='...'        (free — console.groq.com)\n"
+                "     export SILICONFLOW_API_KEY='...'\n"
+                "     export OPENROUTER_API_KEY='...'  (free tiers)\n"
+                "   Or in-app:  key groq <your_key>\n"
+                "   Then restart Athena.\n"
             )
             sys.exit(1)
-        try:
-            self.groq_client = Groq(api_key=groq_key)
-        except Exception as e:
-            print(f"\033[31m   FATAL: Groq init: {e}\033[0m")
-            sys.exit(1)
-        print("\033[32m   ✅ Groq client OK\033[0m")
 
-        # v7.6 — optional SiliconFlow client (OpenAI-compatible). The Groq SDK
-        # is OpenAI-compatible and accepts a base_url, so we reuse it pointed at
-        # SiliconFlow rather than adding an `openai` dependency. Absent key →
-        # the client stays None and SiliconFlow models are skipped in the chain.
-        self.siliconflow_client = None
-        sf_key = os.environ.get("SILICONFLOW_API_KEY")
-        if sf_key:
-            try:
-                self.siliconflow_client = Groq(
-                    api_key=sf_key, base_url=SILICONFLOW_BASE_URL)
-                print("\033[32m   ✅ SiliconFlow client OK "
-                      "(Kimi · GLM · Qwen · DeepSeek)\033[0m")
-            except Exception as e:
-                print(f"\033[33m   SiliconFlow init failed ({str(e)[:50]}) — "
-                      "Groq only\033[0m")
-                self.siliconflow_client = None
+        # backwards-compatible attributes other code may touch
+        self.groq_client = self.clients.get("groq") or next(iter(self.clients.values()))
+        self.siliconflow_client = self.clients.get("siliconflow")
+
+        # Build the chain from live discovery so we never head the chain with a
+        # model this key cannot actually reach (the old static chain 404'd).
+        self._rebuild_chain(live=True, quiet=True)
+
+        labels = ", ".join(
+            f"{provs.REGISTRY[p]['label']}" for p in self.clients)
+        print(f"\033[32m   ✅ Providers OK: {labels}\033[0m")
+        if self.chain:
+            print(f"\033[32m   Active model: {self.chain[self.provider_index][1]} "
+                  f"\033[90m({self.chain[self.provider_index][0]})\033[0m")
         else:
-            print("\033[90m   (set SILICONFLOW_API_KEY to add SiliconFlow "
-                  "models to the fallback chain)\033[0m")
-
-        first = PROVIDER_CHAIN[0]
-        print(f"\033[32m   Active model: {first[1]}\033[0m")
+            print("\033[33m   No models discovered — run `model refresh`.\033[0m")
 
     # ── Logging ───────────────────────────────────────────────────
 
@@ -4866,31 +5035,42 @@ class AthenaSession:
     def _call_provider(self, messages: list, model: str,
                        provider: str = "groq",
                        max_tokens: int = MAX_TOKENS_DEFAULT) -> str:
-        client = self.groq_client
-        if provider == "siliconflow":
-            if self.siliconflow_client is None:
-                raise RuntimeError("siliconflow_unavailable")
-            client = self.siliconflow_client
+        client = self.clients.get(provider)
+        if client is None:
+            raise RuntimeError(f"provider_unavailable:{provider}")
+        try:
+            temp = float(self.settings.get("temperature", 0.2))
+        except Exception:
+            temp = 0.2
+        # Honour the operator's max_tokens setting for the main generation path
+        # (callers that pass an explicit smaller budget, e.g. summaries, keep it).
+        try:
+            cap = int(self.settings.get("max_tokens", 0) or 0)
+            if cap and max_tokens == MAX_TOKENS_DEFAULT:
+                max_tokens = cap
+        except Exception:
+            pass
         completion = client.chat.completions.create(
             model=model,
             messages=messages,
-            temperature=0.2,
+            temperature=temp,
             max_tokens=max_tokens,
         )
         return completion.choices[0].message.content
 
     def _think_with_fallback(self, messages: list,
                              max_tokens: int = MAX_TOKENS_DEFAULT) -> Optional[str]:
+        chain = self.chain or list(PROVIDER_CHAIN)
         start_index = self.provider_index
         last_error = None
 
-        for attempt in range(len(PROVIDER_CHAIN)):
-            idx = (start_index + attempt) % len(PROVIDER_CHAIN)
-            model_id, model_name, provider = PROVIDER_CHAIN[idx]
+        for attempt in range(len(chain)):
+            idx = (start_index + attempt) % len(chain)
+            model_id, model_name, provider = chain[idx]
 
-            # v7.6 — skip SiliconFlow entries when no SiliconFlow key is set,
-            # so a Groq-only install never wastes a fallback hop on them.
-            if provider == "siliconflow" and self.siliconflow_client is None:
+            # Skip any provider we have no client for (e.g. no key configured)
+            # so a fallback hop is never wasted on it.
+            if provider not in self.clients:
                 continue
 
             try:
@@ -4929,8 +5109,9 @@ class AthenaSession:
         return None
 
     def _current_model_name(self) -> str:
-        if 0 <= self.provider_index < len(PROVIDER_CHAIN):
-            return PROVIDER_CHAIN[self.provider_index][1]
+        chain = self.chain or PROVIDER_CHAIN
+        if 0 <= self.provider_index < len(chain):
+            return chain[self.provider_index][1]
         return "Unknown"
 
     # ── Target setup ──────────────────────────────────────────────
@@ -5238,10 +5419,8 @@ class AthenaSession:
 
         # v7.1 — MITRE ATT&CK pre-tag for the command itself
         attack_tag = attack_id_for_command(cmd)
-        attack_label = ""
         if attack_tag:
             tid, tname, tactic = attack_tag
-            attack_label = f"  \033[36m▸ {tid} {tname}\033[0m"
             # Track in session-wide technique counter
             if tid not in self.attack_techniques_used:
                 self.attack_techniques_used[tid] = {
@@ -6554,27 +6733,180 @@ class AthenaSession:
     # ── Help, status, tool status ─────────────────────────────────
 
     def show_model_status(self):
+        chain = self.chain or list(PROVIDER_CHAIN)
         print(f"\n{header_box('  PROVIDER CHAIN  ', color='35')}\n")
-        for i, (model_id, name, provider) in enumerate(PROVIDER_CHAIN):
+        for i, (model_id, name, provider) in enumerate(chain):
             mark = "\033[32m▶ ACTIVE\033[0m" if i == self.provider_index else "      "
-            # grey out SiliconFlow rows when no SiliconFlow key is configured
-            unavailable = (provider == "siliconflow"
-                           and getattr(self, "siliconflow_client", None) is None)
-            tag = "" if provider == "groq" else (
-                " \033[90m(no SF key)\033[0m" if unavailable
-                else " \033[36m(SiliconFlow)\033[0m")
-            name_col = f"\033[90m{name:<22}\033[0m" if unavailable \
-                else f"\033[97m{name:<22}\033[0m"
-            print(f"   {mark}  [{i+1}]  {name_col}  "
+            tag = f" \033[36m({provider})\033[0m"
+            print(f"   {mark}  [{i+1}]  \033[97m{name:<24}\033[0m  "
                   f"\033[90m{model_id}\033[0m{tag}")
         print()
+        # v7.8 — provider availability (live where cheap), so the operator can
+        # see which keys loaded and how many models each exposes.
+        provs = _ext("providers")
+        if provs is not None:
+            print(f"   \033[97mProviders\033[0m "
+                  f"\033[90m(configured: {', '.join(self.clients) or 'none'})\033[0m")
+            try:
+                for r in provs.status(self.settings, live=False):
+                    if not (r["enabled"] or r["key_set"]):
+                        continue
+                    icon = "\033[32m✓\033[0m" if r["enabled"] else "\033[90m·\033[0m"
+                    free = " \033[32mfree\033[0m" if r["free"] else ""
+                    print(f"     {icon} {r['provider']:<12} {r['label']:<22} "
+                          f"\033[90m{r['models']} model(s)\033[0m{free}")
+            except Exception:
+                pass
+            print("\n   \033[90mCommands: model list [provider] · model refresh · "
+                  "model use <provider> <model> · key <provider> <key>\033[0m")
+        print()
+
+    def run_model_cmd(self, user_input: str):
+        """`model [list [provider] | refresh | providers | use <p> <model>]`."""
+        provs = _ext("providers")
+        if provs is None:
+            say_warn("providers module unavailable.")
+            return
+        parts = user_input.split()
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub in ("", "show", "chain", "status"):
+            self.show_model_status()
+            return
+        if sub == "providers":
+            rows = provs.status(self.settings, live=False)
+            print(f"\n{header_box('  PROVIDERS  ', color='35')}\n")
+            for r in rows:
+                key = "set" if r["key_set"] else "—"
+                en = "\033[32menabled\033[0m" if r["enabled"] else "\033[90moff\033[0m"
+                free = "\033[32mfree\033[0m" if r["free"] else "    "
+                print(f"   {r['provider']:<12} {r['label']:<24} key:{key:<4} "
+                      f"{en}  {free}")
+            print("\n   \033[90mSet a key:  key <provider> <api_key>   "
+                  "then:  model refresh\033[0m\n")
+            return
+        if sub == "list":
+            target = parts[2] if len(parts) > 2 else None
+            plist = [target] if target else self._provider_order()
+            if not plist:
+                say_warn("no providers enabled — set a key with `key <provider> <key>`.")
+                return
+            for p in plist:
+                got = provs.list_models(
+                    p, timeout=int(self.settings.get("discover_timeout", 6)),
+                    use_cache=False, settings=self.settings)
+                head = "live" if got.get("ok") else f"fallback ({got.get('error','')[:50]})"
+                print(f"\n   \033[97m{p}\033[0m — {len(got['models'])} models "
+                      f"\033[90m({head})\033[0m")
+                for m in got["models"][:40]:
+                    print(f"     · {m}")
+            print("\n   \033[90mPin one:  model use <provider> <model-id>\033[0m\n")
+            return
+        if sub == "refresh":
+            provs.refresh_cache()
+            say_athena("Refreshing model lists from every enabled provider…")
+            self._rebuild_chain(live=True)
+            self.show_model_status()
+            return
+        if sub == "use":
+            if len(parts) < 4:
+                say_warn("usage: model use <provider> <model-id>")
+                return
+            provider, model = parts[2], " ".join(parts[3:])
+            if provider not in provs.REGISTRY:
+                say_warn(f"unknown provider '{provider}'.")
+                return
+            st = _ext("settings")
+            self.settings = provs.pin(self.settings, provider, model)
+            if st is not None:
+                st.save(self.settings)
+            # ensure a client exists for a newly-used provider BEFORE the chain
+            # rebuild, so the pinned model can be inserted at the head.
+            if provider not in self.clients:
+                self.clients = self._make_clients()
+            self._rebuild_chain(live=True)
+            say_ok(f"Pinned active model → {provider}/{model}")
+            self.show_model_status()
+            return
+        say_warn("usage: model [list [provider] | refresh | providers | "
+                 "use <provider> <model-id>]")
+
+    def show_settings(self, user_input: str = ""):
+        """`settings [show | set <key> <value> | reset | path]`."""
+        st = _ext("settings")
+        if st is None:
+            say_warn("settings module unavailable.")
+            return
+        parts = user_input.split()
+        sub = parts[1].lower() if len(parts) > 1 else "show"
+        if sub in ("", "show"):
+            print(f"\n{header_box('  SETTINGS  ', color='35')}\n")
+            print(st.describe())
+            print("\n   \033[90msettings set <key> <value>   "
+                  "settings reset   settings path\033[0m\n")
+            return
+        if sub == "path":
+            print(st.path())
+            return
+        if sub in ("reset", "defaults"):
+            st.save(dict(st.DEFAULTS))
+            self.settings = st.load()
+            say_ok("settings reset to defaults.")
+            return
+        if sub == "set":
+            if len(parts) < 4:
+                say_warn("usage: settings set <key> <value>")
+                return
+            key = parts[2]
+            raw = " ".join(parts[3:])
+            try:
+                val = json.loads(raw)
+            except Exception:
+                val = raw
+            st.set(key, val)
+            self.settings = st.load()
+            say_ok(f"settings[{key}] = {val!r}")
+            return
+        say_warn("usage: settings [show | set <key> <value> | reset | path]")
+
+    def run_key_cmd(self, user_input: str):
+        """`key <provider> <api_key>` — save a provider key + rebuild clients."""
+        provs = _ext("providers")
+        st = _ext("settings")
+        if provs is None or st is None:
+            say_warn("providers/settings module unavailable.")
+            return
+        parts = user_input.split(None, 2)
+        if len(parts) < 3:
+            say_warn("usage: key <provider> <api_key>   "
+                     "(see `model providers` for names)")
+            return
+        provider, key = parts[1].strip(), parts[2].strip()
+        meta = provs.REGISTRY.get(provider)
+        if meta is None:
+            say_warn(f"unknown provider '{provider}'.  "
+                     f"Known: {', '.join(provs.ORDER)}")
+            return
+        self.settings = provs.set_key(self.settings, provider, key)
+        st.save(self.settings)
+        env = meta.get("env")
+        if env:
+            os.environ[env] = key
+        provs.refresh_cache()
+        self.clients = self._make_clients()
+        self.groq_client = self.clients.get("groq") or (
+            next(iter(self.clients.values())) if self.clients else None)
+        self.siliconflow_client = self.clients.get("siliconflow")
+        self._rebuild_chain(live=True)
+        masked = key[:4] + "…" + key[-4:] if len(key) > 10 else "…"
+        say_ok(f"saved key for {provider} ({masked}); "
+               f"{len(self.clients)} provider(s) active.")
+        if self.chain:
+            say_athena(f"Active model: {self.chain[self.provider_index][1]}")
 
     def show_tools_status(self):
         print(f"\n{header_box('  KALI ARSENAL — AVAILABILITY  ', color='35')}\n")
         # v7.4 — smart subsystem status up top.
-        for n in ("memory", "oracle", "zdayfind", "codescan",
-                  "headroom", "foresight", "sandbox", "webshield",
-              "engage", "recall", "unblock"):
+        for n in EXT_MODULES:
             _ext(n)
         smart = ext_status()
         loaded = [k for k, v in smart.items() if v == "loaded"]
@@ -6714,6 +7046,8 @@ class AthenaSession:
         print()
 
     def show_help(self):
+        for _n in EXT_MODULES:
+            _ext(_n)
         print(
             f"\n   \033[35m\033[1mATHENA v{VERSION}\033[0m"
             f"   \033[90mby The Priest\033[0m\n"
@@ -6727,8 +7061,9 @@ class AthenaSession:
             f"\033[97m{len(TOOL_DISPATCH)}\033[0m structured\n"
             f"   Scope RoE  : \033[97m{'enabled' if self.scope.enabled else 'disabled'}\033[0m\n"
             f"   Graph      : \033[97m{'on' if HAS_NETWORKX else 'off (pip install networkx)'}\033[0m\n"
-            f"   Smart ext  : \033[97m{sum(1 for v in ext_status().values() if v=='loaded')}\033[0m/7 loaded "
-            f"\033[90m(memory·oracle·zday·codescan·headroom·foresight·sandbox·webshield)\033[0m\n\n"
+            f"   Smart ext  : \033[97m{sum(1 for v in ext_status().values() if v=='loaded')}"
+            f"\033[0m/{len(EXT_MODULES)} loaded "
+            f"\033[90m(memory·oracle·exploit·pentest·workspace·research·…)\033[0m\n\n"
             "   \033[97mworkflow\033[0m  open the workflow menu\n"
             "   \033[97mtarget\033[0m    set or update target\n"
             "   \033[97mfindings\033[0m  show extracted findings (verified + unverified)\n"
@@ -6737,13 +7072,17 @@ class AthenaSession:
             "   \033[97mscope\033[0m     show / toggle engagement scope (RoE)\n"
             "   \033[97mmitre\033[0m     show ATT&CK techniques used this session\n"
             "   \033[97mtools\033[0m     show tool availability + auto-install missing\n"
-            "   \033[97mmodel\033[0m     show provider chain status\n"
+            "   \033[97mmodel\033[0m     show provider chain (sub: list · refresh · providers · use)\n"
+            "   \033[96msettings\033[0m  show/edit settings (settings set <key> <value>)\n"
+            "   \033[96mkey\033[0m       'key <provider> <api_key>' — add an LLM provider\n"
             "   \033[97magent\033[0m     show all agent specialists\n"
             "   \033[96mmemory\033[0m    persistent recall — 'memory <query>' to search\n"
             "   \033[96moracle\033[0m    verified-exploitation ledger for this target\n"
             "   \033[96mzday\033[0m      'zday <path>' — variant-analysis source scan\n"
             "   \033[96mcodescan\033[0m  'codescan <path>' — SAST/SCA/secrets plan\n"
             "   \033[96mext\033[0m       smart-subsystem load status\n"
+            "   \033[96mengines\033[0m   in-process engine inventory (ported smart tools)\n"
+            "   \033[96mengine\033[0m    'engine <tool> <json>' — call one directly\n"
             "   \033[97msave\033[0m      save conversation to file\n"
             "   \033[97mreport\033[0m    generate report now\n"
             "   \033[97mclear\033[0m     clear AI memory (PTT preserved)\n"
@@ -6765,9 +7104,7 @@ class AthenaSession:
     def show_ext_status(self):
         """`ext` — show which ported smart modules loaded."""
         # Touch each so status reflects reality, not lazy-load state.
-        for n in ("memory", "oracle", "zdayfind", "codescan",
-                  "headroom", "foresight", "sandbox", "webshield",
-              "engage", "recall", "unblock"):
+        for n in EXT_MODULES:
             _ext(n)
         lines = []
         for name, state in ext_status().items():
@@ -6775,6 +7112,65 @@ class AthenaSession:
             col = "32" if state == "loaded" else "31"
             lines.append(f"  \033[{col}m{mark}\033[0m {name:<10} {state}")
         print(panel("SMART SUBSYSTEMS (athena_ext)", lines, color="36"))
+
+    def show_engines(self):
+        """`engines` — the v7.8 in-process engine inventory."""
+        if _athena_bridge is None:
+            say_warn("bridge unavailable — engines not loaded.")
+            return
+        tools = sorted(_athena_bridge.REGISTRY)
+        lines = [
+            "  \033[97mIn-process engines\033[0m — build/analyse/verify, never fire.",
+            "  \033[90mNo shell, no y/n gate: the operator still runs every attack.\033[0m",
+            "",
+        ]
+        for i in range(0, len(tools), 3):
+            lines.append("   " + "  ".join(
+                f"\033[36m{t:<22}\033[0m" for t in tools[i:i + 3]))
+        lines += [
+            "",
+            "  \033[97mengine <tool> [json-args]\033[0m   call any engine directly",
+            "  \033[90mengine exploit_build {\"kind\":\"ssti_payload\",\"engine\":\"jinja2\"}\033[0m",
+            "  \033[90mengine workspace {\"op\":\"status\"}\033[0m",
+        ]
+        print(panel("ATHENA ENGINES", lines, color="35"))
+
+    def run_engine_cmd(self, user_input: str):
+        """`engine <tool> [json-args]` — invoke any in-process bridge tool."""
+        if _athena_bridge is None:
+            say_warn("bridge unavailable — engines not loaded.")
+            return
+        parts = user_input.split(None, 2)
+        if len(parts) < 2:
+            self.show_engines()
+            return
+        name = parts[1].strip()
+        raw = parts[2].strip() if len(parts) > 2 else ""
+        fn = _athena_bridge.REGISTRY.get(name)
+        if fn is None:
+            near = [t for t in sorted(_athena_bridge.REGISTRY)
+                    if name.lower() in t.lower()]
+            say_warn(f"unknown engine tool '{name}'"
+                     + (f"; did you mean {', '.join(near[:6])}?" if near else ""))
+            return
+        if raw:
+            try:
+                args = json.loads(raw)
+            except json.JSONDecodeError as e:
+                say_warn(f"bad JSON args: {e}")
+                return
+        else:
+            args = {}
+        if not isinstance(args, dict):
+            say_warn("args must be a JSON object")
+            return
+        try:
+            out = fn(self, args)
+        except Exception as e:
+            say_warn(f"{name} error: {type(e).__name__}: {e}")
+            return
+        print(panel(f"ENGINE · {name}",
+                    (out or "").splitlines()[:30] or ["(empty)"], color="36"))
 
     def show_memory(self, user_input: str):
         """`memory [query]` — stats, or recall against a query."""
@@ -6815,7 +7211,6 @@ class AthenaSession:
         except Exception as e:
             say_warn(f"oracle status failed: {e}")
             return
-        counts = st.get("counts") or {}
         lines = [f"  engagement : {st.get('engagement', '—')}",
                  f"  {st.get('summary', '')}"]
         oob = st.get("oob") or {}
@@ -6942,6 +7337,14 @@ class AthenaSession:
                 self.show_tools_status()
             elif cmd == "model":
                 self.show_model_status()
+            elif cmd.startswith("model "):
+                self.run_model_cmd(user_input)
+            elif cmd in ("settings", "cfg", "config"):
+                self.show_settings(user_input)
+            elif cmd.startswith("settings "):
+                self.show_settings(user_input)
+            elif cmd.startswith("key "):
+                self.run_key_cmd(user_input)
             elif cmd == "agent" or cmd == "agents":
                 self.show_agents()
             elif cmd == "save":
@@ -6994,6 +7397,10 @@ class AthenaSession:
                 self.run_codescan(user_input)
             elif cmd == "ext":
                 self.show_ext_status()
+            elif cmd in ("engine", "engines"):
+                self.show_engines()
+            elif cmd.startswith("engine "):
+                self.run_engine_cmd(user_input)
             else:
                 self._agent_loop(user_input, workflow_key=None)
 
@@ -7026,15 +7433,15 @@ def _build_banner() -> str:
         L(f"    {W}██║  ██║   ██║   ██║  ██║███████╗██║ ╚████║██║  ██║{M}       ") + f"{M}│{R}",
         L(f"    {W}╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝{M}       ") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
-        L(f"   {B}{W}AI OFFENSIVE SECURITY AGENT{R}{M}  ·  {B}{C}v7.3{R}{M}                       ") + f"{M}│{R}",
+        L(f"   {B}{W}AI OFFENSIVE SECURITY AGENT{R}{M}  ·  {B}{Y}v7.8{R}{M}                       ") + f"{M}│{R}",
         L(f"   {G}Bare-metal Kali NetHunter  ·  Commander: The Priest{M}            ") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
-        L(f" {G}╭─{C} v7.3 highlights {G}────────────────────────────────────────╮{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Token Savings    {G}tools block gated, KB trimmed{R}       {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Provider Chain   {G}verified Groq models only{R}            {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Instance Vars    {G}no more class-level state leaks{R}      {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ Output Compress  {G}tighter trim + more noise filters{R}    {G}│{M}  ") + f"{M}│{R}",
-        L(f" {G}│{R}  {W}⊕ All v7.2 fixes   {G}tool dispatch, loop breaker, sudo{R}    {G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}╭─{C} v7.8 highlights {G}────────────────────────────────────────╮{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Token Savings    {G}{'tools gated, smart-context KB':<35}{R}{G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Multi-Provider   {G}{'Groq · SF · OpenRouter · Cerebras':<35}{R}{G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Live Models      {G}{'pick from the live catalogue':<35}{R}{G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Smart Engines    {G}{'exploit · pentest · verify + bridge':<35}{R}{G}│{M}  ") + f"{M}│{R}",
+        L(f" {G}│{R}  {W}⊕ Operator Control {G}{'settings panel · GUI + CLI':<35}{R}{G}│{M}  ") + f"{M}│{R}",
         L(f" {G}╰───────────────────────────────────────────────────────────╯{M}  ") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
         L(f"   {G}type  {KB} help {R}{G}  for commands  ·  {KB} workflow {R}{G}  for menus{M}     ") + f"{M}│{R}",

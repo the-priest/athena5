@@ -1,5 +1,5 @@
 """
-memory — persistent, relevance-scoped recall for Athena.
+memory — persistent, relevance-scoped recall for Basilisk.
 
 The "Honcho concept" without the service or the GPU.  Design goals, in order:
 
@@ -12,7 +12,7 @@ The "Honcho concept" without the service or the GPU.  Design goals, in order:
      OPTIONAL: if the host injects an embed_fn, recall upgrades to cosine.
   3. No hidden side-channel.  One SQLite file at a path the operator owns,
      a settings toggle, and a memory_forget tool.  Nothing leaves the box
-     except the same API calls Athena already makes.
+     except the same API calls Basilisk already makes.
 
 Storage model (one table, deliberately boring):
 

@@ -4,8 +4,8 @@ round in circles.
 
 WHY THIS EXISTS
 ===============
-Athena repeated itself.  Not "twice in a row" repeating, which the old
-loop-breaker in athena.py already caught, but the harder kind: re-running
+Basilisk repeated itself.  Not "twice in a row" repeating, which the old
+loop-breaker in basilisk.py already caught, but the harder kind: re-running
 something it had already run three or four steps earlier, with other actions in
 between.
 
@@ -34,8 +34,8 @@ ignores the list anyway.
 
 DESIGN CONTRACT
 ===============
-Same as the rest of athena_ext: this module imports NOTHING from athena.py,
-athena.py or athena.py.  It is pure data + string handling and
+Same as the rest of basilisk_ext: this module imports NOTHING from basilisk.py,
+basilisk_core.py or basilisk_persona.py.  It is pure data + string handling and
 is unit-testable on its own.  If it fails to import, the host degrades to the
 old behaviour rather than breaking.
 """

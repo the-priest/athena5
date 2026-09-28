@@ -1,5 +1,5 @@
 """
-headroom — context compression for Athena.
+headroom — context compression for Basilisk.
 
 What this does, in one line: before a turn's messages go to the model, the
 big `<tool_result>` dumps (nmap, recon, journal tails, web reads, JSON
@@ -19,10 +19,10 @@ Two engines, picked automatically:
      arrays).  This is what runs on the phone, on a fresh box, anywhere the
      wheel won't install.  No dependency, never fails to import.
 
-Design contract (see athena_ext/__init__.py): this module imports NOTHING
-from athena.py / athena.py / athena.py.  It takes the message list
+Design contract (see basilisk_ext/__init__.py): this module imports NOTHING
+from basilisk.py / basilisk_core.py / basilisk_persona.py.  It takes the message list
 and the settings dict and hands back a compressed message list.  Delete the
-package and Athena behaves exactly as before.
+package and Basilisk behaves exactly as before.
 
 Protocol safety — this is load-bearing:
   * The system prompt (role="system") is NEVER touched.  It carries the
@@ -185,13 +185,13 @@ def _real_compress(text: str, target_ratio: float) -> Optional[str]:
         try:
             import headroom as _pkg  # type: ignore
             # ── NAME COLLISION GUARD ──
-            # This module is ALSO called headroom (athena_ext/headroom.py), and
+            # This module is ALSO called headroom (basilisk_ext/headroom.py), and
             # the third-party package it wants is `headroom` too.  Whenever
-            # athena_ext/ ends up on sys.path — tests/test_athena.py,
+            # basilisk_ext/ ends up on sys.path — tests/test_basilisk.py,
             # test_core.py and test_webshield.py all put it there — this import
             # resolves to THIS FILE and the module silently probes itself.
             #
-            # It has never mis-fired at runtime (athena_ext is imported as a
+            # It has never mis-fired at runtime (basilisk_ext is imported as a
             # package, so the absolute import reaches the real one), but it did
             # something worse: it means the tests can NEVER exercise the
             # headroom-ai engine, because in a test process the name always
@@ -200,7 +200,7 @@ def _real_compress(text: str, target_ratio: float) -> Optional[str]:
             #
             # Identity check, not a name check.
             if getattr(_pkg, "__name__", "") == __name__ or _pkg is sys.modules.get(__name__):
-                raise ImportError("resolved to athena_ext's own headroom module")
+                raise ImportError("resolved to basilisk_ext's own headroom module")
             _hc = getattr(_pkg, "compress", None)
             if not callable(_hc):
                 raise ImportError("headroom package has no callable compress()")

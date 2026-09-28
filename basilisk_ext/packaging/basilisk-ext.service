@@ -1,0 +1,42 @@
+# Basilisk headless companion — systemd USER unit (no root, no system files).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp basilisk-ext.service ~/.config/systemd/user/basilisk-ext.service
+#   (edit ExecStart path below if your python or install path differs)
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now basilisk-ext.service
+#
+# Survive logout (so it runs even when no GUI session is open):
+#   loginctl enable-linger "$USER"
+#
+# Status / logs / stop:
+#   systemctl --user status basilisk-ext.service
+#   journalctl --user -u basilisk-ext.service -f
+#   systemctl --user disable --now basilisk-ext.service
+#
+# This unit touches nothing system-wide. It cannot affect NetHunter's own
+# units. Removing it is: disable --now, then delete the file.
+
+[Unit]
+Description=Basilisk headless companion (watcher, memory, skill curation)
+After=default.target
+
+[Service]
+Type=simple
+# Adjust if basilisk_ext lives elsewhere. -m runs the package's worker module.
+ExecStart=%h/.local/bin/python3 -m basilisk_ext.worker
+WorkingDirectory=%h/.local/share/basilisk
+Environment=PYTHONPATH=%h/.local/share/basilisk
+# Reliability: restart on crash, but back off so a hard-failing worker
+# doesn't hot-loop and chew battery on the phone.
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# Be a good citizen on a handset.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target
